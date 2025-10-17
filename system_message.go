@@ -7,8 +7,7 @@ import (
 
 // DefaultSystemMessageFormat is the default template used to format the
 // system message passed to the AI model.
-const DefaultSystemMessageFormat = `name: %s
-description: %s
+const DefaultSystemMessageFormat = `You are %s, %s. 
 instructions:
 %s`
 

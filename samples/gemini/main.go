@@ -4,29 +4,38 @@ import (
 	"context"
 	"database/sql"
 	"log"
+	"os"
 	"time"
-
-	"github.com/gonzxlezs/agens"
-	"github.com/gonzxlezs/agens/extensions/pgmemory"
-	"github.com/gonzxlezs/agens/extensions/timedbatcher"
-	"github.com/gonzxlezs/agens/triggers/tgbot"
 
 	"github.com/PaulSonOfLars/gotgbot/v2"
 	"github.com/PaulSonOfLars/gotgbot/v2/ext"
 	"github.com/firebase/genkit/go/genkit"
 	"github.com/firebase/genkit/go/plugins/googlegenai"
+	"github.com/gonzxlezs/agens"
+	"github.com/gonzxlezs/agens/extensions/pgmemory"
+	"github.com/gonzxlezs/agens/extensions/timedbatcher"
+	"github.com/gonzxlezs/agens/triggers/tgbot"
 	_ "github.com/lib/pq"
-)
-
-const (
-	CONN_STRING = ""
-
-	GEMINI_API_KEY = ""
-
-	TGBOT_TOKEN = ""
+	"google.golang.org/genai"
 )
 
 func main() {
+	// Environment variables
+	CONN_STRING := os.Getenv("CONN_STRING")
+	if CONN_STRING == "" {
+		log.Fatalf("CONN_STRING environment variable is empty")
+	}
+
+	GEMINI_API_KEY := os.Getenv("GEMINI_API_KEY")
+	if GEMINI_API_KEY == "" {
+		log.Fatalf("GEMINI_API_KEY environment variable is empty")
+	}
+
+	TGBOT_TOKEN := os.Getenv("TGBOT_TOKEN")
+	if TGBOT_TOKEN == "" {
+		log.Fatalf("TGBOT_TOKEN environment variable is empty")
+	}
+
 	// Genkit
 	ctx := context.Background()
 
@@ -36,7 +45,16 @@ func main() {
 				APIKey: GEMINI_API_KEY,
 			},
 		),
-		genkit.WithDefaultModel("googleai/gemini-2.5-flash"),
+	)
+
+	model := googlegenai.GoogleAIModelRef(
+		"gemini-2.5-flash",
+		&genai.GenerateContentConfig{
+			MaxOutputTokens: 500,
+			Temperature:     genai.Ptr[float32](0.5),
+			TopP:            genai.Ptr[float32](0.4),
+			TopK:            genai.Ptr[float32](50),
+		},
 	)
 
 	// PGMemory
@@ -62,11 +80,11 @@ func main() {
 	// Agent
 	e21 := &agens.Agent{
 		Name:        "e21",
-		Description: "General AI assistant",
+		Description: "a general-purpose virtual assistant",
 		Instructions: []string{
-			"You are a general-purpose virtual assistant.",
 			"You receive messages from users via a Telegram bot and must respond to their messages.",
 		},
+		Model: model,
 		Batcher: &timedbatcher.TimedBatcher{
 			Duration: 5 * time.Second,
 		},

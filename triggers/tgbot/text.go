@@ -16,6 +16,8 @@ import (
 
 const TextMessageFormat = "Telegram Bot: message %d, chat %d, user %d (%s %s, %s): %s (%d unix)"
 
+var outputType = []SendMessageParameters{}
+
 func NewUserTextMessage(msg *gotgbot.Message) *ai.Message {
 	if msg == nil {
 		return &ai.Message{}
@@ -49,7 +51,10 @@ func (trigger *Trigger) TextHandler(agent *agens.Agent) ext.Handler {
 			agens.SetUserID(aiMsg, userID)
 			agens.SetConversationID(aiMsg, conversationID)
 
-			resp, err := agent.Run(context.Background(), aiMsg)
+			ctx := context.Background()
+			ctx = agens.WithOutputOption(ctx, ai.WithOutputType(outputType))
+
+			resp, err := agent.Run(ctx, aiMsg)
 			if err != nil {
 				return err
 			}
@@ -58,7 +63,12 @@ func (trigger *Trigger) TextHandler(agent *agens.Agent) ext.Handler {
 				return nil
 			}
 
-			return trigger.SendMessage(tgCtx, resp.Message)
+			var params []SendMessageParameters
+			if err := resp.Output(&params); err != nil {
+				return err
+			}
+
+			return trigger.SendMessage(tgCtx, params)
 		},
 	)
 }

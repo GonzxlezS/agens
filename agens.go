@@ -120,6 +120,16 @@ func (agent *Agent) coreFunc(ctx context.Context, msg *ai.Message) (*ai.ModelRes
 		opts = append(opts, ai.WithTools(agent.Tools...))
 	}
 
+	// output option
+	outputOpt, err := agent.outputOption(ctx)
+	if err != nil {
+		return EmptyModelResponse(), err
+	}
+
+	if outputOpt != nil {
+		opts = append(opts, outputOpt)
+	}
+
 	// generate
 	resp, err := genkit.Generate(ctx, agent.g, opts...)
 	if err != nil {
