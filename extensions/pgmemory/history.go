@@ -6,14 +6,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/gonzxlezs/agens"
 
 	"github.com/firebase/genkit/go/ai"
 )
-
-const StoredKey = "stored"
 
 const (
 	HistoryTableQuery = `CREATE TABLE IF NOT EXISTS history (
@@ -27,7 +26,7 @@ const (
 
 	HistoryTimeIndexQuery = `CREATE INDEX IF NOT EXISTS idx_history_created_at ON history(created_at ASC)`
 
-	RetrieveHistory = `SELECT message 
+	RetrieveHistory = `SELECT id, message
     FROM history
     WHERE conversation_id = $1
     ORDER BY created_at ASC`
@@ -78,8 +77,13 @@ type HistoryMemory struct {
 	db *sql.DB
 }
 
-func NewHistoryMemory(db *sql.DB) *HistoryMemory {
-	return &HistoryMemory{db: db}
+func NewHistoryMemory(ctx context.Context, db *sql.DB) (*HistoryMemory, error) {
+	memory := &HistoryMemory{db: db}
+	if err := db.Ping(); err != nil {
+		return nil, err
+	}
+
+	return memory, memory.Init(ctx)
 }
 
 func (m *HistoryMemory) Init(ctx context.Context) error {
@@ -111,9 +115,12 @@ func (m *HistoryMemory) RetrieveHistory(ctx context.Context, conversationID stri
 
 	var messages []*ai.Message
 	for rows.Next() {
-		var msgJSON []byte
+		var (
+			storedID int64
+			msgJSON  []byte
+		)
 
-		if err := rows.Scan(&msgJSON); err != nil {
+		if err := rows.Scan(&storedID, &msgJSON); err != nil {
 			return nil, fmt.Errorf("error scanning row: %w", err)
 		}
 
@@ -122,10 +129,10 @@ func (m *HistoryMemory) RetrieveHistory(ctx context.Context, conversationID stri
 			return nil, fmt.Errorf("error unmarshaling message: %w", err)
 		}
 
-		if msg.Metadata == nil {
-			msg.Metadata = make(map[string]any)
-		}
-		msg.Metadata[StoredKey] = true
+		msg = *agens.SetStoredID(
+			&msg,
+			strconv.FormatInt(storedID, 10),
+		)
 
 		messages = append(messages, &msg)
 	}
@@ -138,12 +145,13 @@ func (m *HistoryMemory) StoreHistory(ctx context.Context, conversationID string,
 	for _, msg := range history {
 		// Skip system messages and those that have already been stored.
 		if msg.Role != ai.RoleSystem {
-			if msg.Metadata != nil {
-				stored, ok := msg.Metadata[StoredKey].(bool)
-				if ok && stored {
-					continue
-				}
+			storedID, err := agens.GetStoredID(msg)
+			if err != nil {
+				return err
+			} else if storedID != "" {
+				continue
 			}
+
 			filtered = append(filtered, msg)
 		}
 	}

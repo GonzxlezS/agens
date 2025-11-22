@@ -3,13 +3,13 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"time"
 
-	"github.com/PaulSonOfLars/gotgbot/v2"
-	"github.com/PaulSonOfLars/gotgbot/v2/ext"
 	"github.com/firebase/genkit/go/genkit"
 	"github.com/firebase/genkit/go/plugins/googlegenai"
 	"github.com/gonzxlezs/agens"
@@ -24,17 +24,32 @@ func main() {
 	// Environment variables
 	CONN_STRING := os.Getenv("CONN_STRING")
 	if CONN_STRING == "" {
-		panic("CONN_STRING environment variable is empty")
+		log.Fatalf("CONN_STRING environment variable is empty")
 	}
 
 	GEMINI_API_KEY := os.Getenv("GEMINI_API_KEY")
 	if GEMINI_API_KEY == "" {
-		panic("GEMINI_API_KEY environment variable is empty")
+		log.Fatalf("GEMINI_API_KEY environment variable is empty")
+	}
+
+	PORT := os.Getenv("PORT")
+	if PORT == "" {
+		log.Fatalf("PORT environment variable is empty")
 	}
 
 	TGBOT_TOKEN := os.Getenv("TGBOT_TOKEN")
 	if TGBOT_TOKEN == "" {
-		panic("TGBOT_TOKEN environment variable is empty")
+		log.Fatalf("TGBOT_TOKEN environment variable is empty")
+	}
+
+	TGBOT_WEBHOOK_DOMAIN := os.Getenv("TGBOT_WEBHOOK_DOMAIN")
+	if TGBOT_WEBHOOK_DOMAIN == "" {
+		log.Fatalf("TGBOT_WEBHOOK_DOMAIN environment variable is empty")
+	}
+
+	TGBOT_WEBHOOK_SECRET := os.Getenv("TGBOT_WEBHOOK_SECRET")
+	if TGBOT_WEBHOOK_SECRET == "" {
+		log.Fatalf("TGBOT_TOKEN environment variable is empty")
 	}
 
 	// Genkit
@@ -92,25 +107,10 @@ func main() {
 	}
 
 	// Telegram bot trigger
-	tgTrigger, err := tgbot.NewTrigger(
+	tgTrigger, err := tgbot.NewHTTPTrigger(
 		TGBOT_TOKEN,
-		&tgbot.TriggerOpts{
-			DispatcherOpts: &ext.DispatcherOpts{
-				Error: func(b *gotgbot.Bot, ctx *ext.Context, err error) ext.DispatcherAction {
-					log.Println(err.Error())
-					return ext.DispatcherActionNoop
-				},
-				MaxRoutines: ext.DefaultMaxRoutines,
-			},
-			PollingOpts: &ext.PollingOpts{
-				DropPendingUpdates: true,
-				GetUpdatesOpts: &gotgbot.GetUpdatesOpts{
-					Timeout: 9,
-					RequestOpts: &gotgbot.RequestOpts{
-						Timeout: time.Second * 10,
-					},
-				},
-			},
+		&tgbot.HTTPTriggerOpts{
+			SecretToken: TGBOT_WEBHOOK_SECRET,
 		},
 	)
 
@@ -122,10 +122,30 @@ func main() {
 		panic(err)
 	}
 
-	if err := tgTrigger.Start(ctx); err != nil {
+	mux := http.NewServeMux()
+	for _, route := range tgTrigger.GetRoutes() {
+		pattern := fmt.Sprintf("%s %s", route.Method, route.Path)
+		mux.HandleFunc(pattern, route.Handler)
+	}
+
+	server := &http.Server{
+		Addr:    ":" + PORT,
+		Handler: mux,
+	}
+
+	go func(server *http.Server) {
+		fmt.Printf("Listening for webhooks on port %s...\n", PORT)
+
+		err := server.ListenAndServe()
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			panic("HTTP server failed: " + err.Error())
+		}
+	}(server)
+
+	err = tgTrigger.SetWebhook(TGBOT_WEBHOOK_DOMAIN)
+	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("%s has been started...\n", tgTrigger.Bot.User.Username)
 
 	select {}
 }

@@ -2,6 +2,7 @@ package tgbot
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strconv"
 
@@ -14,45 +15,32 @@ import (
 	"github.com/firebase/genkit/go/ai"
 )
 
-const TextMessageFormat = "Telegram Bot: message %d, chat %d, user %d (%s %s, %s): %s (%d unix)"
+var outputType = []*SendMessageParameters{}
 
-var outputType = []SendMessageParameters{}
-
-func NewUserTextMessage(msg *gotgbot.Message) *ai.Message {
-	if msg == nil {
-		return &ai.Message{}
-	}
-
-	s := fmt.Sprintf(TextMessageFormat,
-		msg.MessageId,
-		msg.Chat.Id,
-		msg.From.Id,
-		msg.From.FirstName, msg.From.LastName,
-		msg.From.Username,
-		msg.Text,
-		msg.Date,
-	)
-
-	return ai.NewUserTextMessage(s)
-}
-
-func (trigger *Trigger) TextHandler(agent *agens.Agent) ext.Handler {
+func (trigger *BaseTrigger) TextHandler(agent *agens.Agent) ext.Handler {
 	return handlers.NewMessage(
 		message.Text,
 		func(b *gotgbot.Bot, tgCtx *ext.Context) error {
+			msg := tgCtx.Update.Message
+			jsonMsg, err := json.Marshal(msg)
+			if err != nil {
+				return err
+			}
+
 			var (
-				msg            = tgCtx.Update.Message
-				aiMsg          = NewUserTextMessage(msg)
+				aiMsg          = ai.NewUserTextMessage(string(jsonMsg))
 				userID         = strconv.FormatInt(msg.From.Id, 10)
-				conversationID = strconv.FormatInt(msg.Chat.Id, 10)
+				conversationID = fmt.Sprintf("%s:%d", trigger.Name(), msg.Chat.Id)
+
+				ctx = agens.WithOutputOption(
+					context.Background(),
+					ai.WithOutputType(outputType),
+				)
 			)
 
 			agens.SetSource(aiMsg, trigger.Name())
 			agens.SetUserID(aiMsg, userID)
 			agens.SetConversationID(aiMsg, conversationID)
-
-			ctx := context.Background()
-			ctx = agens.WithOutputOption(ctx, ai.WithOutputType(outputType))
 
 			resp, err := agent.Run(ctx, aiMsg)
 			if err != nil {
@@ -63,7 +51,7 @@ func (trigger *Trigger) TextHandler(agent *agens.Agent) ext.Handler {
 				return nil
 			}
 
-			var params []SendMessageParameters
+			var params []*SendMessageParameters
 			if err := resp.Output(&params); err != nil {
 				return err
 			}

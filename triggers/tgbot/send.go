@@ -8,76 +8,76 @@ import (
 const MaxLengthMessageText = 4096
 
 type SendMessageParameters struct {
-	ChatID  int64  `json:"chat_id,omitempty"`
-	Text    string `json:"text"`
-	ReplyTo int64  `json:"reply_to,omitempty"`
+	// ChatID Unique identifier for the target chat
+	ChatID int64 `json:"chat_id"`
+
+	// Text text of the message to be sent, 1-4096 characters after entities parsing
+	Text string `json:"text"`
+
+	// ParseMode mode for parsing entities in the message text.
+	ParseMode string `json:"parse_mode,omitempty" jsonschema:"enum=HTML,enum=MarkdownV2,enum=Markdown"`
+
+	// ReplyParameters description of the message to reply to
+	ReplyParameters *gotgbot.ReplyParameters `json:"reply_parameters,omitempty"`
 }
 
-func (trigger *Trigger) SendMessage(tgCtx *ext.Context, params []SendMessageParameters) error {
-	var err error
+func (params *SendMessageParameters) newWithText(text string) *SendMessageParameters {
+	return &SendMessageParameters{
+		ChatID:          params.ChatID,
+		Text:            text,
+		ParseMode:       params.ParseMode,
+		ReplyParameters: params.ReplyParameters,
+	}
+}
 
-	for _, msgParams := range params {
+func (params *SendMessageParameters) sendMessageOpts() *gotgbot.SendMessageOpts {
+	return &gotgbot.SendMessageOpts{
+		ParseMode:       params.ParseMode,
+		ReplyParameters: params.ReplyParameters,
+	}
+}
+
+func (trigger *BaseTrigger) SendMessage(tgCtx *ext.Context, sendParams []*SendMessageParameters) error {
+	for _, params := range splitMessageText(sendParams) {
 		// chat id
-		if msgParams.ChatID == 0 {
-			msgParams.ChatID = tgCtx.Message.Chat.Id
+		if params.ChatID == 0 {
+			params.ChatID = tgCtx.Message.Chat.Id
 		}
 
-		// text length
-		if len(msgParams.Text) <= MaxLengthMessageText {
-			_, err = trigger.sendMessage(&msgParams)
+		// send
+		_, err := trigger.Bot.SendMessage(
+			params.ChatID,
+			params.Text,
+			params.sendMessageOpts(),
+		)
+
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func splitMessageText(sendParams []*SendMessageParameters) []*SendMessageParameters {
+	var result []*SendMessageParameters
+
+	for _, params := range sendParams {
+		runes := []rune(params.Text)
+		runeLength := len(runes)
+
+		if runeLength <= MaxLengthMessageText {
+			result = append(result, params)
 			continue
 		}
 
-		// split message
-		var replyTo = msgParams.ReplyTo
+		// split
+		for i := 0; i < runeLength; i += MaxLengthMessageText {
+			end := min(i+MaxLengthMessageText, runeLength)
 
-		for _, chunk := range splitMessageText(msgParams.Text) {
-			NewMsgParams := &SendMessageParameters{
-				ChatID:  msgParams.ChatID,
-				Text:    chunk,
-				ReplyTo: replyTo,
-			}
-
-			replyTo, err = trigger.sendMessage(NewMsgParams)
-			if err != nil {
-				break
-			}
+			result = append(result, params.newWithText(string(runes[i:end])))
 		}
 	}
 
-	return err
-}
-
-func (trigger *Trigger) sendMessage(params *SendMessageParameters) (int64, error) {
-	msg, err := trigger.Bot.SendMessage(
-		params.ChatID,
-		params.Text,
-		&gotgbot.SendMessageOpts{
-			ReplyParameters: &gotgbot.ReplyParameters{
-				MessageId: params.ReplyTo,
-			},
-		},
-	)
-
-	if err != nil {
-		return 0, err
-	}
-	return msg.MessageId, nil
-}
-
-func splitMessageText(text string) []string {
-	var (
-		textLength = len(text)
-		chunks     []string
-	)
-
-	for i := 0; i < textLength; i += MaxLengthMessageText {
-		end := i + MaxLengthMessageText
-		if end > textLength {
-			end = textLength
-		}
-
-		chunks = append(chunks, text[i:end])
-	}
-	return chunks
+	return result
 }
