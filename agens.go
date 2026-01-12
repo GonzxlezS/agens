@@ -13,133 +13,102 @@ import (
 )
 
 const (
+	// DelegationMessage is a text message that accompanies the FinishReasonDelegated finish reason.
+	DelegationMessage = "The message has been delegated to another flow for handling."
+
 	// FinishReasonDelegated is a custom finish reason indicating that the message
 	// was delegated to another flow or component for handling.
 	FinishReasonDelegated ai.FinishReason = "delegated"
-
-	// DelegationMessage is a text message that accompanies the FinishReasonDelegated finish reason.
-	DelegationMessage = "The message has been delegated to another flow for handling."
 )
 
-// ErrAgentNotInitialized is returned if an attempt is made to run an agent
-// that has not been properly initialized.
-var ErrAgentNotInitialized = errors.New("agent not initialized")
+var (
+	// ErrAgentNotInitialized is returned if an attempt is made to run an agent
+	// that has not been properly initialized.
+	ErrAgentNotInitialized = errors.New("agent not initialized")
 
-// Agent represents a generic AI agent.
-// It contains the necessary configuration to define its behavior, including
-// the AI model to use, the available tools, and the logic for managing
-// conversation history memory.
+	// ErrKnowledgeMemoryNotConfigured is returned when an operation is attempted
+	// on an agent that does not have a KnowledgeMemory initialized.
+	ErrKnowledgeMemoryNotConfigured = errors.New("knowledge memory is not configured for this agent")
+)
+
+// Agent represents a generic AI agent that encapsulates execution logic (flow).
 type Agent struct {
-	// Name is the name of the agent, used to identify its flow in Genkit.
-	Name string
+	config          *AgentConfig
+	knowledgeMemory KnowledgeMemory
+	historyMemory   HistoryMemory
 
-	// Description is a brief description of the agent's purpose.
-	Description string
-
-	// Instructions are high-level instructions that guide the AI model's behavior.
-	Instructions []string
-
-	// Model is the AI model that the agent will use to generate responses.
-	Model ai.ModelArg
-
-	// Tools is a list of tools that the agent can use.
-	Tools []ai.ToolRef
-
-	// AdditionalOptions are extra options passed to the genkit.Generate function.
-	AdditionalOptions []ai.GenerateOption
-
-	// Batcher is responsible for batching incoming messages.
-	Batcher MessageBatcher
-
-	// HistoryMemory is responsible for persisting the conversation history.
-	HistoryMemory HistoryMemory
-
-	// FormatSystemMessage is an optional function for formatting the system message.
-	FormatSystemMessage func(*Agent) string
-
-	g    *genkit.Genkit
 	flow *core.Flow[*ai.Message, *ai.ModelResponse, struct{}]
 }
 
-// Init initializes the agent and registers its flow with the Genkit object.
-// It must be called before the agent can be used.
-func (agent *Agent) Init(ctx context.Context, g *genkit.Genkit) error {
-	agent.g = g
-	agent.flow = genkit.DefineFlow(g, agent.Name, agent.coreFunc)
-	return nil
+// NewAgent initializes a new Agent instance. It defines a Genkit flow based on the provided AgentConfig.
+func NewAgent(g *genkit.Genkit, cfg AgentConfig) (*Agent, error) {
+	var (
+		agent = &Agent{config: &cfg}
+		err   error
+	)
+
+	// history memory
+	if cfg.HistoryProvider != nil {
+		agent.historyMemory, err = cfg.HistoryProvider.ForAgent(cfg.Name, cfg.MaxMessagesPerConversation)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// knowledge
+	if cfg.KnowledgeProvider != nil {
+		agent.knowledgeMemory, err = cfg.KnowledgeProvider.ForAgent(cfg.Name, cfg.KnowledgeRetrieveLimit)
+		if err != nil {
+			return nil, err
+		}
+
+		agent.config.Tools = append(
+			agent.config.Tools,
+			agent.knowledgeMemory.AsTool(),
+		)
+	}
+
+	// flow
+	agent.flow = genkit.DefineFlow(g, cfg.Name, baseFlow(g, &cfg, agent.historyMemory))
+
+	return agent, nil
 }
 
-// Run executes the agent's flow with a given message.
-// It returns a model response or an error.
+// DeleteKnowledge removes documents associated with a specific label from the agent's memory.
+// It returns ErrKnowledgeMemoryNotConfigured if the agent was not initialized with knowledge capabilities.
+func (agent *Agent) DeleteKnowledge(ctx context.Context, label string) error {
+	if agent.knowledgeMemory == nil {
+		return ErrKnowledgeMemoryNotConfigured
+	}
+	return agent.knowledgeMemory.DeleteKnowledge(ctx, label)
+}
+
+// IndexKnowledge adds and indexes a set of documents into the agent's memory under a given label.
+// This allows the agent to retrieve this information later during conversations.
+// It returns ErrKnowledgeMemoryNotConfigured if the agent was not initialized with knowledge capabilities.
+func (agent *Agent) IndexKnowledge(ctx context.Context, label string, docs []*ai.Document) error {
+	if agent.knowledgeMemory == nil {
+		return ErrKnowledgeMemoryNotConfigured
+	}
+	return agent.knowledgeMemory.IndexKnowledge(ctx, label, docs)
+}
+
+// Name returns the identifier of the agent defined in its configuration.
+// If the agent or its configuration is nil, it returns an empty string.
+func (agent *Agent) Name() string {
+	if agent == nil || agent.config == nil {
+		return ""
+	}
+	return agent.config.Name
+}
+
+// Run executes the agent's internal flow with a given message within the provided context.
+// It returns a *ai.ModelResponse containing the AI's output or an error if execution fails.
 func (agent *Agent) Run(ctx context.Context, msg *ai.Message) (*ai.ModelResponse, error) {
-	if (agent.g == nil) || (agent.flow == nil) {
+	if agent.flow == nil {
 		return EmptyModelResponse(), ErrAgentNotInitialized
 	}
 	return agent.flow.Run(ctx, msg)
-}
-
-func (agent *Agent) coreFunc(ctx context.Context, msg *ai.Message) (*ai.ModelResponse, error) {
-	if agent.g == nil {
-		return EmptyModelResponse(), ErrAgentNotInitialized
-	}
-
-	// message batch
-	batch, err := agent.messageBatch(ctx, msg)
-	if err != nil {
-		return EmptyModelResponse(), err
-	}
-	if len(batch) == 0 {
-		return DelegatedModelResponse(), nil
-	}
-
-	// history
-	conversationID, err := GetConversationID(msg)
-	if err != nil {
-		return EmptyModelResponse(), err
-	}
-
-	history, err := agent.retrieveHistory(ctx, conversationID)
-	if err != nil {
-		return EmptyModelResponse(), err
-	}
-
-	// messages
-	messages := append(history, batch...)
-
-	// options
-	opts := append(agent.AdditionalOptions,
-		ai.WithSystem(agent.SystemMessage()),
-		ai.WithMessages(messages...),
-	)
-
-	if agent.Model != nil {
-		opts = append(opts, ai.WithModel(agent.Model))
-	}
-
-	if len(agent.Tools) > 0 {
-		opts = append(opts, ai.WithTools(agent.Tools...))
-	}
-
-	// output option
-	outputOpt, err := agent.outputOption(ctx)
-	if err != nil {
-		return EmptyModelResponse(), err
-	}
-
-	if outputOpt != nil {
-		opts = append(opts, outputOpt)
-	}
-
-	// generate
-	resp, err := genkit.Generate(ctx, agent.g, opts...)
-	if err != nil {
-		return EmptyModelResponse(), err
-	}
-
-	// store history
-	err = agent.storeHistory(ctx, conversationID, resp.History())
-
-	return resp, err
 }
 
 // DelegatedModelResponse creates a model response that indicates the message

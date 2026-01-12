@@ -1,7 +1,6 @@
 package timedbatcher
 
 import (
-	"errors"
 	"sync"
 	"time"
 
@@ -9,8 +8,6 @@ import (
 
 	"github.com/firebase/genkit/go/ai"
 )
-
-var ErrCannotAddMessage = errors.New("cannot add message to batch")
 
 var _ agens.MessageBatcher = &TimedBatcher{}
 
@@ -21,12 +18,7 @@ type TimedBatcher struct {
 	channels map[string]chan *ai.Message
 }
 
-func (b *TimedBatcher) Add(msg *ai.Message) ([]*ai.Message, error) {
-	conversationID, err := agens.GetConversationID(msg)
-	if err != nil {
-		return nil, err
-	}
-
+func (b *TimedBatcher) Add(conversationID string, msg *ai.Message) ([]*ai.Message, error) {
 	b.mu.Lock()
 	if b.channels == nil {
 		b.channels = make(map[string]chan *ai.Message)

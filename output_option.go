@@ -20,7 +20,10 @@ func WithOutputOption(ctx context.Context, opt ai.OutputOption) context.Context 
 	return context.WithValue(ctx, OutputOptionKey{}, opt)
 }
 
-func (agent *Agent) outputOption(ctx context.Context) (ai.OutputOption, error) {
+// GetOutputOption retrieves the ai.OutputOption from the provided context.
+// It returns (nil, nil) if no option is found. If the value stored in the context
+// is not of type ai.OutputOption, it returns nil and ErrInvalidOutputOption.
+func GetOutputOption(ctx context.Context) (ai.OutputOption, error) {
 	v := ctx.Value(OutputOptionKey{})
 	if v == nil {
 		return nil, nil

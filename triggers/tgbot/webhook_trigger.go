@@ -10,9 +10,9 @@ import (
 
 const DefaultSubPath = "/tgbot/"
 
-var _ agens.HTTPTrigger = &HTTPTrigger{}
+var _ agens.WebhookTrigger = &WebhookTrigger{}
 
-type HTTPTriggerOpts struct {
+type WebhookTriggerOpts struct {
 	BotOpts        *gotgbot.BotOpts
 	DispatcherOpts *ext.DispatcherOpts
 	UpdaterOpts    *ext.UpdaterOpts
@@ -22,32 +22,33 @@ type HTTPTriggerOpts struct {
 	SetWebhookOpts *gotgbot.SetWebhookOpts
 }
 
-type HTTPTrigger struct {
-	BaseTrigger
+type WebhookTrigger struct {
+	BaseTrigger *Trigger
 
 	SubPath        string
 	SecretToken    string
 	SetWebhookOpts *gotgbot.SetWebhookOpts
 }
 
-func NewHTTPTrigger(token string, opts *HTTPTriggerOpts) (*HTTPTrigger, error) {
+func NewWebhookTrigger(token string, opts *WebhookTriggerOpts) (*WebhookTrigger, error) {
 	var (
-		trigger = &HTTPTrigger{}
+		trigger = &WebhookTrigger{}
 		err     error
 	)
 
 	if opts == nil {
-		opts = &HTTPTriggerOpts{}
+		opts = &WebhookTriggerOpts{}
 	}
 
-	trigger.Bot, err = gotgbot.NewBot(token, opts.BotOpts)
+	trigger.BaseTrigger, err = NewTrigger(token, &TriggerOpts{
+		BotOpts:        opts.BotOpts,
+		DispatcherOpts: opts.DispatcherOpts,
+		UpdaterOpts:    opts.UpdaterOpts,
+	})
+
 	if err != nil {
 		return nil, err
 	}
-
-	trigger.Dispatcher = ext.NewDispatcher(opts.DispatcherOpts)
-
-	trigger.Updater = ext.NewUpdater(trigger.Dispatcher, opts.UpdaterOpts)
 
 	trigger.SubPath = DefaultSubPath
 	if opts.SubPath != "" {
@@ -61,43 +62,43 @@ func NewHTTPTrigger(token string, opts *HTTPTriggerOpts) (*HTTPTrigger, error) {
 	return trigger, nil
 }
 
-func (trigger *HTTPTrigger) Name() string {
+func (trigger *WebhookTrigger) Name() string {
 	return trigger.BaseTrigger.Name() + "Webhook"
 }
 
-func (trigger *HTTPTrigger) RegisterAgent(agent *agens.Agent) error {
+func (trigger *WebhookTrigger) RegisterAgent(agent *agens.Agent) error {
 	err := trigger.BaseTrigger.RegisterAgent(agent)
 	if err != nil {
 		return err
 	}
 
-	return trigger.Updater.AddWebhook(
-		trigger.Bot,
-		trigger.Bot.Token,
+	return trigger.BaseTrigger.Updater.AddWebhook(
+		trigger.BaseTrigger.Bot,
+		trigger.BaseTrigger.Bot.Token,
 		&ext.AddWebhookOpts{
 			SecretToken: trigger.SecretToken,
 		},
 	)
 }
 
-func (trigger *HTTPTrigger) GetRoutes() []agens.HTTPTriggerRoute {
-	return []agens.HTTPTriggerRoute{
+func (trigger *WebhookTrigger) GetRoutes() []agens.WebhookTriggerRoute {
+	return []agens.WebhookTriggerRoute{
 		{
 			Method:  http.MethodPost,
 			Path:    trigger.SubPath,
-			Handler: trigger.Updater.GetHandlerFunc(trigger.SubPath),
+			Handler: trigger.BaseTrigger.Updater.GetHandlerFunc(trigger.SubPath),
 		},
 	}
 }
 
-func (trigger *HTTPTrigger) SetWebhook(baseURL string) error {
+func (trigger *WebhookTrigger) SetWebhook(baseURL string) error {
 	if trigger.SetWebhookOpts == nil {
 		trigger.SetWebhookOpts = &gotgbot.SetWebhookOpts{}
 	}
 
 	trigger.SetWebhookOpts.SecretToken = trigger.SecretToken
 
-	return trigger.Updater.SetAllBotWebhooks(
+	return trigger.BaseTrigger.Updater.SetAllBotWebhooks(
 		baseURL+trigger.SubPath,
 		trigger.SetWebhookOpts,
 	)

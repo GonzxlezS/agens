@@ -4,14 +4,15 @@ import (
 	"context"
 
 	"github.com/firebase/genkit/go/ai"
-	"github.com/firebase/genkit/go/genkit"
 )
 
-const (
-	RetrieveHistoryStep = "retrieveHistory"
-
-	StoreHistoryStep = "storeHistory"
-)
+// HistoryProvider defines an interface for providing history memory instances
+// tailored for specific agents.
+type HistoryProvider interface {
+	// ForAgent initializes or retrieves a HistoryMemory implementation for the
+	// specified agentName, limiting the history to maxMessagesPerConversation if applicable.
+	ForAgent(agentName string, maxMessagesPerConversation int) (HistoryMemory, error)
+}
 
 // HistoryMemory is an interface for managing the history of a conversation.
 type HistoryMemory interface {
@@ -28,26 +29,4 @@ type HistoryMemory interface {
 
 	// Close performs any necessary cleanup, such as closing database connections.
 	Close() error
-}
-
-func (agent *Agent) retrieveHistory(ctx context.Context, conversationID string) ([]*ai.Message, error) {
-	if agent.HistoryMemory == nil {
-		return nil, nil
-	}
-
-	return genkit.Run(ctx, RetrieveHistoryStep, func() ([]*ai.Message, error) {
-		return agent.HistoryMemory.RetrieveHistory(ctx, conversationID)
-	})
-}
-
-func (agent *Agent) storeHistory(ctx context.Context, conversationID string, history []*ai.Message) error {
-	if agent.HistoryMemory == nil {
-		return nil
-	}
-
-	_, err := genkit.Run(ctx, StoreHistoryStep, func() (struct{}, error) {
-		err := agent.HistoryMemory.StoreHistory(ctx, conversationID, history)
-		return struct{}{}, err
-	})
-	return err
 }

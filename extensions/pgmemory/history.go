@@ -15,99 +15,89 @@ import (
 )
 
 const (
-	HistoryTableQuery = `CREATE TABLE IF NOT EXISTS history (
-    id SERIAL PRIMARY KEY,
-    conversation_id TEXT NOT NULL,
-    message JSONB NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )`
-
-	HistorySourceIndexQuery = `CREATE INDEX IF NOT EXISTS idx_history_conversation_id ON history(conversation_id)`
-
-	HistoryTimeIndexQuery = `CREATE INDEX IF NOT EXISTS idx_history_created_at ON history(created_at ASC)`
-
-	RetrieveHistory = `SELECT id, message
+	RetrieveHistoryQuery = `SELECT id, message
     FROM history
-    WHERE conversation_id = $1
+    WHERE agent_name = $1
+		AND conversation_id = $2
     ORDER BY created_at ASC`
 
-	DeleteHistory = `DELETE FROM history WHERE conversation_id = $1`
+	DeleteHistoryQuery = `DELETE FROM history WHERE agent_name = $1 AND conversation_id = $2`
 
-	HistoryTrigger = `DROP TRIGGER IF EXISTS enforce_message_limit ON history;
-CREATE TRIGGER enforce_message_limit
-AFTER INSERT ON history
-FOR EACH ROW
-EXECUTE FUNCTION limit_messages_per_conversation();`
-
-	HistoryTriggerFunctionFormat = `CREATE OR REPLACE FUNCTION limit_messages_per_conversation()
-RETURNS TRIGGER AS $$
-DECLARE
-    message_count INTEGER;
-    message_limit INTEGER := %d;
-BEGIN
-    -- Get the current number of messages for the conversation
-    SELECT COUNT(*) INTO message_count
-    FROM history
-    WHERE conversation_id = NEW.conversation_id;
-
-    -- If the count exceeds the limit
-    IF message_count > message_limit THEN
-        -- Delete the oldest messages
-        DELETE FROM history
-        WHERE conversation_id = NEW.conversation_id
-        AND id IN (
-            SELECT id
-            FROM history
-            WHERE conversation_id = NEW.conversation_id
-            ORDER BY created_at ASC -- Order by oldest messages first
-            LIMIT (message_count - message_limit) -- Limit to the exact number of excess messages
-        );
-    END IF;
-
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;`
+	SetMaxMessagesPerConversationQuery = `INSERT INTO history_agent_limits (
+	agent_name, 
+	max_msgs_conversation
+	) VALUES ($1, $2)
+		ON CONFLICT (agent_name)
+		DO UPDATE SET 
+    		max_msgs_conversation = EXCLUDED.max_msgs_conversation;`
 )
 
-var ErrDBNotInitialized = errors.New("database connection not initialized")
+var ErrDBNotInitialized = errors.New("pgmemory: database connection not initialized")
 
-var _ agens.HistoryMemory = &HistoryMemory{}
+var _ agens.HistoryProvider = &HistoryProvider{}
+var _ agens.HistoryMemory = &historyMemory{}
 
-type HistoryMemory struct {
+type HistoryProvider struct {
 	db *sql.DB
 }
 
-func NewHistoryMemory(ctx context.Context, db *sql.DB) (*HistoryMemory, error) {
-	memory := &HistoryMemory{db: db}
+func NewHistoryProvider(db *sql.DB) (*HistoryProvider, error) {
 	if err := db.Ping(); err != nil {
 		return nil, err
 	}
 
-	return memory, memory.Init(ctx)
+	if err := runModuleMigration(db, "history", "migrations_history"); err != nil {
+		return nil, fmt.Errorf("history migrations failed: %w", err)
+	}
+
+	return &HistoryProvider{db: db}, nil
 }
 
-func (m *HistoryMemory) Init(ctx context.Context) error {
-	if m.db == nil {
+func (p *HistoryProvider) ForAgent(agentName string, maxMessages int) (agens.HistoryMemory, error) {
+	err := p.setMaxMessagesPerConversation(agentName, maxMessages)
+	if err != nil {
+		return nil, err
+	}
+	return &historyMemory{provider: p, agentName: agentName}, nil
+}
+
+func (p *HistoryProvider) Close() error {
+	if p.db != nil {
+		return p.db.Close()
+	}
+	return nil
+}
+
+func (p *HistoryProvider) setMaxMessagesPerConversation(agentName string, max int) error {
+	if p.db == nil {
 		return ErrDBNotInitialized
 	}
 
-	if _, err := m.db.ExecContext(ctx, HistoryTableQuery); err != nil {
-		return fmt.Errorf("error creating history table: %w", err)
-	}
-
-	if _, err := m.db.ExecContext(ctx, HistorySourceIndexQuery); err != nil {
-		return fmt.Errorf("error creating history conversation index: %w", err)
-	}
-
-	if _, err := m.db.ExecContext(ctx, HistoryTimeIndexQuery); err != nil {
-		return fmt.Errorf("error creating history time index: %w", err)
+	if _, err := p.db.Exec(SetMaxMessagesPerConversationQuery, agentName, max); err != nil {
+		return fmt.Errorf("error set max messages: %w", err)
 	}
 
 	return nil
 }
 
-func (m *HistoryMemory) RetrieveHistory(ctx context.Context, conversationID string) ([]*ai.Message, error) {
-	rows, err := m.db.QueryContext(ctx, RetrieveHistory, conversationID)
+func (p *HistoryProvider) deleteHistory(ctx context.Context, agentName string, conversationID string) error {
+	if p.db == nil {
+		return ErrDBNotInitialized
+	}
+
+	_, err := p.db.ExecContext(ctx, DeleteHistoryQuery, agentName, conversationID)
+	if err != nil {
+		return fmt.Errorf("error deleting history: %w", err)
+	}
+	return nil
+}
+
+func (p *HistoryProvider) retrieveHistory(ctx context.Context, agentName string, conversationID string) ([]*ai.Message, error) {
+	if p.db == nil {
+		return nil, ErrDBNotInitialized
+	}
+
+	rows, err := p.db.QueryContext(ctx, RetrieveHistoryQuery, agentName, conversationID)
 	if err != nil {
 		return nil, fmt.Errorf("error querying history: %w", err)
 	}
@@ -137,10 +127,14 @@ func (m *HistoryMemory) RetrieveHistory(ctx context.Context, conversationID stri
 		messages = append(messages, &msg)
 	}
 
-	return messages, nil
+	return messages, rows.Err()
 }
 
-func (m *HistoryMemory) StoreHistory(ctx context.Context, conversationID string, history []*ai.Message) error {
+func (p *HistoryProvider) storeHistory(ctx context.Context, agentName string, conversationID string, history []*ai.Message) error {
+	if p.db == nil {
+		return ErrDBNotInitialized
+	}
+
 	var filtered []*ai.Message
 	for _, msg := range history {
 		// Skip system messages and those that have already been stored.
@@ -160,7 +154,7 @@ func (m *HistoryMemory) StoreHistory(ctx context.Context, conversationID string,
 		return nil
 	}
 
-	tx, err := m.db.BeginTx(ctx, nil)
+	tx, err := p.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("error starting transaction: %w", err)
 	}
@@ -176,12 +170,12 @@ func (m *HistoryMemory) StoreHistory(ctx context.Context, conversationID string,
 			return fmt.Errorf("error serializing message: %w", err)
 		}
 
-		vStrings = append(vStrings, fmt.Sprintf("($%d, $%d)", (i*2)+1, (i*2)+2))
-		vArgs = append(vArgs, conversationID, msgJSON)
+		vStrings = append(vStrings, fmt.Sprintf("($%d, $%d, $%d)", (i*3)+1, (i*3)+2, (i*3)+3))
+		vArgs = append(vArgs, agentName, conversationID, msgJSON)
 	}
 
 	stmt := fmt.Sprintf(
-		"INSERT INTO history (conversation_id, message) VALUES %s",
+		"INSERT INTO history (agent_name, conversation_id, message) VALUES %s",
 		strings.Join(vStrings, ", "),
 	)
 
@@ -191,34 +185,23 @@ func (m *HistoryMemory) StoreHistory(ctx context.Context, conversationID string,
 	return tx.Commit()
 }
 
-func (m *HistoryMemory) DeleteHistory(ctx context.Context, conversationID string) error {
-	_, err := m.db.ExecContext(ctx, DeleteHistory, conversationID)
-	if err != nil {
-		return fmt.Errorf("error deleting history: %w", err)
-	}
-	return nil
+type historyMemory struct {
+	provider  *HistoryProvider
+	agentName string
 }
 
-func (m *HistoryMemory) Close() error {
-	if m.db != nil {
-		return m.db.Close()
-	}
-	return nil
+func (m *historyMemory) DeleteHistory(ctx context.Context, conversationID string) error {
+	return m.provider.deleteHistory(ctx, m.agentName, conversationID)
 }
 
-func (m *HistoryMemory) SetMaxMessagesPerConversation(ctx context.Context, max int) error {
-	if m.db == nil {
-		return ErrDBNotInitialized
-	}
+func (m *historyMemory) RetrieveHistory(ctx context.Context, conversationID string) ([]*ai.Message, error) {
+	return m.provider.retrieveHistory(ctx, m.agentName, conversationID)
+}
 
-	historyTriggerFunction := fmt.Sprintf(HistoryTriggerFunctionFormat, max)
-	if _, err := m.db.ExecContext(ctx, historyTriggerFunction); err != nil {
-		return fmt.Errorf("error creating function: %w", err)
-	}
+func (m *historyMemory) StoreHistory(ctx context.Context, conversationID string, history []*ai.Message) error {
+	return m.provider.storeHistory(ctx, m.agentName, conversationID, history)
+}
 
-	if _, err := m.db.ExecContext(ctx, HistoryTrigger); err != nil {
-		return fmt.Errorf("error creating trigger: %w", err)
-	}
-
+func (_ *historyMemory) Close() error {
 	return nil
 }

@@ -21,7 +21,9 @@ type TriggerOpts struct {
 }
 
 type Trigger struct {
-	BaseTrigger
+	Bot        *gotgbot.Bot
+	Dispatcher *ext.Dispatcher
+	Updater    *ext.Updater
 
 	PollingOpts *ext.PollingOpts
 }
@@ -48,6 +50,15 @@ func NewTrigger(token string, opts *TriggerOpts) (*Trigger, error) {
 	trigger.PollingOpts = opts.PollingOpts
 
 	return trigger, nil
+}
+
+func (trigger *Trigger) Name() string {
+	return "TelegramBot"
+}
+
+func (trigger *Trigger) RegisterAgent(agent *agens.Agent) error {
+	trigger.Dispatcher.AddHandler(trigger.TextHandler(agent))
+	return nil
 }
 
 func (trigger *Trigger) Start(_ context.Context) error {

@@ -7,9 +7,9 @@ import (
 )
 
 const (
-	// ConversationIDKey is the key used in message metadata to store the
-	// unique identifier for a conversation.
-	ConversationIDKey = "conversation_id"
+	// ChannelIDKey is the key used in message metadata to store the
+	// unique identifier for a channel.
+	ChannelIDKey = "channel_id"
 
 	// SourceKey is the key used in message metadata to store the source of the message
 	SourceKey = "source"
@@ -27,9 +27,9 @@ var (
 	// ErrMetadataNotFound is returned if the message metadata map is nil.
 	ErrMetadataNotFound = errors.New("metadata not found")
 
-	// ErrConversationIDNotInMetadata is returned if the conversation ID is not present
+	// ErrChannelIDNotInMetadata is returned if the channel ID is not present
 	// in the message metadata.
-	ErrConversationIDNotInMetadata = errors.New("conversation ID not found in metadata")
+	ErrChannelIDNotInMetadata = errors.New("channel ID not found in metadata")
 
 	// ErrSourceNotInMetadata is returned if the source is not present
 	// in the message metadata.
@@ -39,9 +39,9 @@ var (
 	// in the message metadata.
 	ErrUserIDNotInMetadata = errors.New("user ID not found in metadata")
 
-	// ErrConversationIDNotAString is returned if the conversation ID in metadata
+	// ErrChannelIDNotAString is returned if the channel ID in metadata
 	// is not a string.
-	ErrConversationIDNotAString = errors.New("conversation ID is not a string type")
+	ErrChannelIDNotAString = errors.New("channel ID is not a string type")
 
 	// ErrSourceNotAString is returned if the source in metadata is not a string.
 	ErrSourceNotAString = errors.New("source is not a string type")
@@ -70,20 +70,20 @@ func setMetadata(msg *ai.Message, key string, value any) *ai.Message {
 	return msg
 }
 
-// GetConversationID retrieves the conversation ID from a message's metadata.
+// GetChannelID retrieves the channel ID from a message's metadata.
 // It returns the ID as a string and an error if the ID is missing or invalid.
-func GetConversationID(msg *ai.Message) (string, error) {
-	v, ok, err := getMetadata(msg, ConversationIDKey)
+func GetChannelID(msg *ai.Message) (string, error) {
+	v, ok, err := getMetadata(msg, ChannelIDKey)
 	if err != nil {
 		return "", err
 	} else if !ok {
-		return "", ErrConversationIDNotInMetadata
+		return "", ErrChannelIDNotInMetadata
 	}
 
 	if id, ok := v.(string); ok {
 		return id, nil
 	}
-	return "", ErrConversationIDNotAString
+	return "", ErrChannelIDNotAString
 }
 
 // GetSource retrieves the message source from a message's metadata.
@@ -131,9 +131,9 @@ func GetUserID(msg *ai.Message) (string, error) {
 	return "", ErrUserIDNotAString
 }
 
-// SetConversationID sets the conversation ID in a message's metadata.
-func SetConversationID(msg *ai.Message, id string) *ai.Message {
-	return setMetadata(msg, ConversationIDKey, id)
+// SetChannelID sets the channel ID in a message's metadata.
+func SetChannelID(msg *ai.Message, id string) *ai.Message {
+	return setMetadata(msg, ChannelIDKey, id)
 }
 
 // SetSource sets the message source in a message's metadata.

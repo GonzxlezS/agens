@@ -15,8 +15,9 @@ import (
 	"github.com/gonzxlezs/agens"
 	"github.com/gonzxlezs/agens/extensions/pgmemory"
 	"github.com/gonzxlezs/agens/extensions/timedbatcher"
-	"github.com/gonzxlezs/agens/triggers/tgbot"
+	"github.com/gonzxlezs/agens/triggers/wabot"
 	_ "github.com/lib/pq"
+	wapi "github.com/wapikit/wapi.go/pkg/client"
 	"google.golang.org/genai"
 )
 
@@ -37,19 +38,19 @@ func main() {
 		log.Fatalf("PORT environment variable is empty")
 	}
 
-	TGBOT_TOKEN := os.Getenv("TGBOT_TOKEN")
-	if TGBOT_TOKEN == "" {
-		log.Fatalf("TGBOT_TOKEN environment variable is empty")
+	WA_TOKEN := os.Getenv("WA_TOKEN")
+	if WA_TOKEN == "" {
+		log.Fatalf("WA_TOKEN environment variable is empty")
 	}
 
-	TGBOT_WEBHOOK_DOMAIN := os.Getenv("TGBOT_WEBHOOK_DOMAIN")
-	if TGBOT_WEBHOOK_DOMAIN == "" {
-		log.Fatalf("TGBOT_WEBHOOK_DOMAIN environment variable is empty")
+	WA_BUSINESS_ID := os.Getenv("WA_BUSINESS_ID")
+	if WA_BUSINESS_ID == "" {
+		log.Fatalf("WA_BUSINESS_ID environment variable is empty")
 	}
 
-	TGBOT_WEBHOOK_SECRET := os.Getenv("TGBOT_WEBHOOK_SECRET")
-	if TGBOT_WEBHOOK_SECRET == "" {
-		log.Fatalf("TGBOT_TOKEN environment variable is empty")
+	WEBHOOK_SECRET := os.Getenv("WEBHOOK_SECRET")
+	if WEBHOOK_SECRET == "" {
+		log.Fatalf("WEBHOOK_SECRET environment variable is empty")
 	}
 
 	// Genkit
@@ -79,52 +80,45 @@ func main() {
 		panic(err)
 	}
 
-	pgm, err := pgmemory.NewHistoryMemory(ctx, db)
-	if err := pgm.Init(ctx); err != nil {
-		panic(err)
-	}
-
-	if err := pgm.SetMaxMessagesPerConversation(ctx, 10); err != nil {
+	pgm, err := pgmemory.NewHistoryProvider(db)
+	if err != nil {
 		panic(err)
 	}
 
 	// Agent
-	e21 := &agens.Agent{
+	e21, err := agens.NewAgent(g, agens.AgentConfig{
 		Name:        "e21",
 		Description: "a general-purpose virtual assistant",
 		Instructions: []string{
-			"You receive messages from users via a Telegram bot and must respond to their messages.",
+			"You receive messages from users via a WhatsApp bot and must respond to their messages.",
 		},
 		Model: model,
 		Batcher: &timedbatcher.TimedBatcher{
-			Duration: 5 * time.Second,
+			Duration: 10 * time.Second,
 		},
-		HistoryMemory: pgm,
-	}
-
-	if err := e21.Init(ctx, g); err != nil {
-		panic(err)
-	}
-
-	// Telegram bot trigger
-	tgTrigger, err := tgbot.NewHTTPTrigger(
-		TGBOT_TOKEN,
-		&tgbot.HTTPTriggerOpts{
-			SecretToken: TGBOT_WEBHOOK_SECRET,
-		},
-	)
+		HistoryProvider:            pgm,
+		MaxMessagesPerConversation: 10,
+	})
 
 	if err != nil {
 		panic(err)
 	}
 
-	if err := tgTrigger.RegisterAgent(e21); err != nil {
+	// Whatsapp bot trigger
+	waTrigger := wabot.NewWebhookTrigger(&wapi.ClientConfig{
+		BusinessAccountId: WA_BUSINESS_ID,
+		ApiAccessToken:    WA_TOKEN,
+		WebhookSecret:     WEBHOOK_SECRET,
+	})
+
+	if err := waTrigger.RegisterAgent(e21); err != nil {
 		panic(err)
 	}
 
 	mux := http.NewServeMux()
-	for _, route := range tgTrigger.GetRoutes() {
+	for _, route := range waTrigger.GetRoutes() {
 		pattern := fmt.Sprintf("%s %s", route.Method, route.Path)
+		fmt.Println(pattern)
 		mux.HandleFunc(pattern, route.Handler)
 	}
 
@@ -133,18 +127,11 @@ func main() {
 		Handler: mux,
 	}
 
-	go func(server *http.Server) {
-		fmt.Printf("Listening for webhooks on port %s...\n", PORT)
+	fmt.Printf("Listening for webhooks on port %s...\n", PORT)
 
-		err := server.ListenAndServe()
-		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			panic("HTTP server failed: " + err.Error())
-		}
-	}(server)
-
-	err = tgTrigger.SetWebhook(TGBOT_WEBHOOK_DOMAIN)
-	if err != nil {
-		panic(err)
+	err = server.ListenAndServe()
+	if err != nil && !errors.Is(err, http.ErrServerClosed) {
+		panic("HTTP server failed: " + err.Error())
 	}
 
 	select {}

@@ -64,17 +64,13 @@ func main() {
 		panic(err)
 	}
 
-	pgm, err := pgmemory.NewHistoryMemory(ctx, db)
-	if err := pgm.Init(ctx); err != nil {
-		panic(err)
-	}
-
-	if err := pgm.SetMaxMessagesPerConversation(ctx, 10); err != nil {
+	pgm, err := pgmemory.NewHistoryProvider(db)
+	if err != nil {
 		panic(err)
 	}
 
 	// Agent
-	e21 := &agens.Agent{
+	e21, err := agens.NewAgent(g, agens.AgentConfig{
 		Name:        "e21",
 		Description: "a general-purpose virtual assistant",
 		Instructions: []string{
@@ -84,10 +80,11 @@ func main() {
 		Batcher: &timedbatcher.TimedBatcher{
 			Duration: 5 * time.Second,
 		},
-		HistoryMemory: pgm,
-	}
+		HistoryProvider:            pgm,
+		MaxMessagesPerConversation: 5,
+	})
 
-	if err := e21.Init(ctx, g); err != nil {
+	if err != nil {
 		panic(err)
 	}
 

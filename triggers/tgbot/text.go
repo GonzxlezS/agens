@@ -3,7 +3,6 @@ package tgbot
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"strconv"
 
 	"github.com/gonzxlezs/agens"
@@ -15,9 +14,36 @@ import (
 	"github.com/firebase/genkit/go/ai"
 )
 
-var outputType = []*SendMessageParameters{}
+const MaxLengthMessageText = 4096
 
-func (trigger *BaseTrigger) TextHandler(agent *agens.Agent) ext.Handler {
+type MessageResponse struct {
+	// Text text of the message to be sent, 1-4096 characters after entities parsing.
+	Text string `json:"text" jsonschema_description:"Text of the message to be sent, 1-4096 characters after entities parsing."`
+
+	// ParseMode mode for parsing entities in the message text.
+	ParseMode string `json:"parse_mode,omitempty" jsonschema:"enum=HTML,enum=MarkdownV2,enum=Markdown,description=Mode for parsing entities in the message text."`
+
+	// ReplyTo identifier of the message that will be replied to in the current chat.
+	ReplyTo int64 `json:"reply_to,omitempty" jsonschema_description:"Identifier of the message that will be replied to in the current chat."`
+}
+
+func (params *MessageResponse) sendMessageOpts() *gotgbot.SendMessageOpts {
+	return &gotgbot.SendMessageOpts{
+		ParseMode: params.ParseMode,
+		ReplyParameters: &gotgbot.ReplyParameters{
+			MessageId: params.ReplyTo,
+		},
+	}
+}
+
+type MessageResponses struct {
+	// Messages list of messages to be sent via the Telegram bot
+	Messages []*MessageResponse `json:"messages" jsonschema:"description=List of messages to be sent via the Telegram bot,minItems=1,required"`
+}
+
+var outputType = MessageResponses{}
+
+func (trigger *Trigger) TextHandler(agent *agens.Agent) ext.Handler {
 	return handlers.NewMessage(
 		message.Text,
 		func(b *gotgbot.Bot, tgCtx *ext.Context) error {
@@ -28,9 +54,11 @@ func (trigger *BaseTrigger) TextHandler(agent *agens.Agent) ext.Handler {
 			}
 
 			var (
-				aiMsg          = ai.NewUserTextMessage(string(jsonMsg))
-				userID         = strconv.FormatInt(msg.From.Id, 10)
-				conversationID = fmt.Sprintf("%s:%d", trigger.Name(), msg.Chat.Id)
+				aiMsg  = ai.NewUserTextMessage(string(jsonMsg))
+				userID = strconv.FormatInt(tgCtx.EffectiveUser.Id, 10)
+
+				chatID    = tgCtx.EffectiveChat.Id
+				channelID = strconv.FormatInt(chatID, 10)
 
 				ctx = agens.WithOutputOption(
 					context.Background(),
@@ -40,7 +68,7 @@ func (trigger *BaseTrigger) TextHandler(agent *agens.Agent) ext.Handler {
 
 			agens.SetSource(aiMsg, trigger.Name())
 			agens.SetUserID(aiMsg, userID)
-			agens.SetConversationID(aiMsg, conversationID)
+			agens.SetChannelID(aiMsg, channelID)
 
 			resp, err := agent.Run(ctx, aiMsg)
 			if err != nil {
@@ -51,12 +79,70 @@ func (trigger *BaseTrigger) TextHandler(agent *agens.Agent) ext.Handler {
 				return nil
 			}
 
-			var params []*SendMessageParameters
+			var params MessageResponses
 			if err := resp.Output(&params); err != nil {
 				return err
 			}
 
-			return trigger.SendMessage(tgCtx, params)
+			return trigger.SendMessage(chatID, params.Messages)
 		},
 	)
+}
+
+func (trigger *Trigger) SendMessage(chatID int64, sendParams []*MessageResponse) error {
+	var (
+		lastMsg *gotgbot.Message
+		err     error
+	)
+
+	for _, params := range splitMessageText(sendParams) {
+		// reply to
+		if params.ReplyTo == -1 {
+			if lastMsg != nil {
+				params.ReplyTo = lastMsg.MessageId
+			} else {
+				params.ReplyTo = 0
+			}
+		}
+
+		// send
+		lastMsg, err = trigger.Bot.SendMessage(chatID, params.Text, params.sendMessageOpts())
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func splitMessageText(sendParams []*MessageResponse) []*MessageResponse {
+	var result []*MessageResponse
+
+	for _, params := range sendParams {
+		var (
+			runes      = []rune(params.Text)
+			runeLength = len(runes)
+
+			replyTo = params.ReplyTo
+		)
+
+		if runeLength <= MaxLengthMessageText {
+			result = append(result, params)
+			continue
+		}
+
+		// split
+		for i := 0; i < runeLength; i += MaxLengthMessageText {
+			end := min(i+MaxLengthMessageText, runeLength)
+
+			result = append(result, &MessageResponse{
+				Text:      string(runes[i:end]),
+				ParseMode: params.ParseMode,
+				ReplyTo:   replyTo,
+			})
+
+			replyTo = -1 // last msg
+		}
+	}
+
+	return result
 }
