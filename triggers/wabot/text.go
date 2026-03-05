@@ -10,49 +10,65 @@ import (
 	"github.com/wapikit/wapi.go/pkg/events"
 )
 
-func (trigger *WebhookTrigger) TextHandler(agent *agens.Agent) func(event events.BaseEvent) {
-	return func(event events.BaseEvent) {
-		textMessageEvent := event.(*events.TextMessageEvent)
+func (trigger *WebhookTrigger) TextHandler(event events.BaseEvent) {
+	textMessageEvent := event.(*events.TextMessageEvent)
 
-		jsonMsg, err := json.Marshal(textMessageEvent)
+	jsonMsg, err := json.Marshal(textMessageEvent)
+	if err != nil {
+		trigger.Logger.Error(err.Error())
+		return
+	}
+
+	var (
+		aiMsg  = ai.NewUserTextMessage(string(jsonMsg))
+		source = textMessageEvent.From
+
+		ctx = context.Background()
+	)
+
+	// batch
+	var batch = []*ai.Message{aiMsg}
+
+	if trigger.Batcher != nil {
+		batch, err = trigger.Batcher.Add(ctx, source, aiMsg)
 		if err != nil {
 			trigger.Logger.Error(err.Error())
 			return
 		}
 
-		var (
-			aiMsg = ai.NewUserTextMessage(string(jsonMsg))
-			from  = textMessageEvent.From
-
-			ctx = context.Background()
-		)
-
-		agens.SetSource(aiMsg, trigger.Name())
-		agens.SetUserID(aiMsg, from)
-		agens.SetChannelID(aiMsg, from)
-
-		resp, err := agent.Run(ctx, aiMsg)
-		if err != nil {
-			trigger.Logger.Error(err.Error())
+		// delegated
+		if len(batch) == 0 {
 			return
 		}
+	}
 
-		if resp.FinishReason == agens.FinishReasonDelegated {
-			return
-		}
+	// input
+	input := &agens.Input{
+		Trigger:  trigger.TriggerID,
+		Source:   source,
+		Messages: batch,
+	}
 
-		msg, err := components.NewTextMessage(components.TextMessageConfigs{
-			Text: resp.Text(),
-		})
+	// generate
+	resp, err := trigger.Agent.Generate(ctx, input)
+	if err != nil {
+		trigger.Logger.Error(err.Error())
+		return
+	}
 
-		if err != nil {
-			trigger.Logger.Error("error creating text message: " + err.Error())
-			return
-		}
+	// output
+	msg, err := components.NewTextMessage(components.TextMessageConfigs{
+		Text: resp.Text(),
+	})
 
-		_, err = textMessageEvent.Reply(msg)
-		if err != nil {
-			trigger.Logger.Error(err.Error())
-		}
+	if err != nil {
+		trigger.Logger.Error("error creating text message: " + err.Error())
+		return
+	}
+
+	// send
+	_, err = textMessageEvent.Reply(msg)
+	if err != nil {
+		trigger.Logger.Error(err.Error())
 	}
 }

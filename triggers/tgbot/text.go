@@ -5,13 +5,10 @@ import (
 	"encoding/json"
 	"strconv"
 
-	"github.com/gonzxlezs/agens"
-
 	"github.com/PaulSonOfLars/gotgbot/v2"
 	"github.com/PaulSonOfLars/gotgbot/v2/ext"
-	"github.com/PaulSonOfLars/gotgbot/v2/ext/handlers"
-	"github.com/PaulSonOfLars/gotgbot/v2/ext/handlers/filters/message"
 	"github.com/firebase/genkit/go/ai"
+	"github.com/gonzxlezs/agens"
 )
 
 const MaxLengthMessageText = 4096
@@ -41,55 +38,62 @@ type MessageResponses struct {
 	Messages []*MessageResponse `json:"messages" jsonschema:"description=List of messages to be sent via the Telegram bot,minItems=1,required"`
 }
 
-var outputType = MessageResponses{}
+func (trigger *Trigger) TextHandler(_ *gotgbot.Bot, tgCtx *ext.Context) error {
+	jsonMsg, err := json.Marshal(tgCtx.Update.Message)
+	if err != nil {
+		return err
+	}
 
-func (trigger *Trigger) TextHandler(agent *agens.Agent) ext.Handler {
-	return handlers.NewMessage(
-		message.Text,
-		func(b *gotgbot.Bot, tgCtx *ext.Context) error {
-			msg := tgCtx.Update.Message
-			jsonMsg, err := json.Marshal(msg)
-			if err != nil {
-				return err
-			}
+	var (
+		chatID = tgCtx.EffectiveChat.Id
+		source = strconv.FormatInt(chatID, 10)
 
-			var (
-				aiMsg  = ai.NewUserTextMessage(string(jsonMsg))
-				userID = strconv.FormatInt(tgCtx.EffectiveUser.Id, 10)
+		msg = ai.NewUserTextMessage(string(jsonMsg))
 
-				chatID    = tgCtx.EffectiveChat.Id
-				channelID = strconv.FormatInt(chatID, 10)
-
-				ctx = agens.WithOutputOption(
-					context.Background(),
-					ai.WithOutputType(outputType),
-				)
-			)
-
-			agens.SetSource(aiMsg, trigger.Name())
-			agens.SetUserID(aiMsg, userID)
-			agens.SetChannelID(aiMsg, channelID)
-
-			resp, err := agent.Run(ctx, aiMsg)
-			if err != nil {
-				return err
-			}
-
-			if resp.FinishReason == agens.FinishReasonDelegated {
-				return nil
-			}
-
-			var params MessageResponses
-			if err := resp.Output(&params); err != nil {
-				return err
-			}
-
-			return trigger.SendMessage(chatID, params.Messages)
-		},
+		ctx = context.Background()
 	)
+
+	// batch
+	var batch = []*ai.Message{msg}
+
+	if trigger.Batcher != nil {
+		batch, err = trigger.Batcher.Add(ctx, source, msg)
+		if err != nil {
+			return err
+		}
+
+		// delegated
+		if len(batch) == 0 {
+			return nil
+		}
+	}
+
+	// input
+	input := &agens.Input{
+		Trigger:  trigger.TriggerID,
+		Source:   source,
+		Messages: batch,
+	}
+
+	input = input.WithOutputType(MessageResponses{})
+
+	// generate
+	resp, err := trigger.Agent.Generate(ctx, input)
+	if err != nil {
+		return err
+	}
+
+	// output
+	var params MessageResponses
+	if err := resp.Output(&params); err != nil {
+		return err
+	}
+
+	// send
+	return sendMessage(trigger.Bot, chatID, params.Messages)
 }
 
-func (trigger *Trigger) SendMessage(chatID int64, sendParams []*MessageResponse) error {
+func sendMessage(bot *gotgbot.Bot, chatID int64, sendParams []*MessageResponse) error {
 	var (
 		lastMsg *gotgbot.Message
 		err     error
@@ -106,7 +110,7 @@ func (trigger *Trigger) SendMessage(chatID int64, sendParams []*MessageResponse)
 		}
 
 		// send
-		lastMsg, err = trigger.Bot.SendMessage(chatID, params.Text, params.sendMessageOpts())
+		lastMsg, err = bot.SendMessage(chatID, params.Text, params.sendMessageOpts())
 		if err != nil {
 			return err
 		}

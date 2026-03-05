@@ -80,7 +80,7 @@ func main() {
 		panic(err)
 	}
 
-	pgm, err := pgmemory.NewHistoryProvider(db)
+	historyMemory, err := pgmemory.NewHistoryMemory("history", db)
 	if err != nil {
 		panic(err)
 	}
@@ -92,12 +92,9 @@ func main() {
 		Instructions: []string{
 			"You receive messages from users via a WhatsApp bot and must respond to their messages.",
 		},
-		Model: model,
-		Batcher: &timedbatcher.TimedBatcher{
-			Duration: 10 * time.Second,
-		},
-		HistoryProvider:            pgm,
-		MaxMessagesPerConversation: 10,
+		Model:             model,
+		HistoryMemory:     historyMemory,
+		HistoryMemorySize: 10,
 	})
 
 	if err != nil {
@@ -105,16 +102,26 @@ func main() {
 	}
 
 	// Whatsapp bot trigger
-	waTrigger := wabot.NewWebhookTrigger(&wapi.ClientConfig{
+	waTrigger, err := wabot.NewWebhookTrigger("wa01", &wapi.ClientConfig{
 		BusinessAccountId: WA_BUSINESS_ID,
 		ApiAccessToken:    WA_TOKEN,
 		WebhookSecret:     WEBHOOK_SECRET,
 	})
 
+	if err != nil {
+		panic(err)
+	}
+
 	if err := waTrigger.RegisterAgent(e21); err != nil {
 		panic(err)
 	}
 
+	batcher := &timedbatcher.TimedBatcher{Duration: 10 * time.Second}
+	if err := waTrigger.WithBatcher(batcher); err != nil {
+		panic(err)
+	}
+
+	// server
 	mux := http.NewServeMux()
 	for _, route := range waTrigger.GetRoutes() {
 		pattern := fmt.Sprintf("%s %s", route.Method, route.Path)

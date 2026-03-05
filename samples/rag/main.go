@@ -12,12 +12,16 @@ import (
 	"github.com/PaulSonOfLars/gotgbot/v2/ext"
 	"github.com/firebase/genkit/go/ai"
 	"github.com/firebase/genkit/go/genkit"
+	"github.com/firebase/genkit/go/plugins/googlegenai"
 	"github.com/firebase/genkit/go/plugins/ollama"
 	"github.com/gonzxlezs/agens"
 	"github.com/gonzxlezs/agens/extensions/pgmemory"
 	"github.com/gonzxlezs/agens/extensions/timedbatcher"
 	"github.com/gonzxlezs/agens/triggers/tgbot"
 	_ "github.com/lib/pq"
+	"google.golang.org/genai"
+
+	_ "github.com/joho/godotenv/autoload"
 )
 
 func main() {
@@ -25,6 +29,11 @@ func main() {
 	CONN_STRING := os.Getenv("CONN_STRING")
 	if CONN_STRING == "" {
 		panic("CONN_STRING environment variable is empty")
+	}
+
+	GEMINI_API_KEY := os.Getenv("GEMINI_API_KEY")
+	if GEMINI_API_KEY == "" {
+		panic("GEMINI_API_KEY environment variable is empty")
 	}
 
 	TGBOT_TOKEN := os.Getenv("TGBOT_TOKEN")
@@ -49,31 +58,23 @@ func main() {
 	g := genkit.Init(ctx,
 		genkit.WithPlugins(
 			ollamaPlugin,
+			&googlegenai.GoogleAI{
+				APIKey: GEMINI_API_KEY,
+			},
 		),
 	)
 
-	// NOTE: https://github.com/firebase/genkit/issues/3810
-	model := ollamaPlugin.DefineModel(
-		g,
-		ollama.ModelDefinition{
-			Name: "qwen3:0.6b",
-			Type: "chat",
-		},
-		&ai.ModelOptions{
-			Supports: &ai.ModelSupports{
-				// Constrained: ai.ConstrainedSupportAll,
-				// Context:   true,
-				Multiturn:  true,
-				SystemRole: true,
-				ToolChoice: true,
-				Tools:      true,
-			},
+	model := googlegenai.GoogleAIModelRef(
+		"gemini-2.5-flash",
+		&genai.GenerateContentConfig{
+			MaxOutputTokens: 500,
+			Temperature:     genai.Ptr[float32](0.5),
+			TopP:            genai.Ptr[float32](0.4),
+			TopK:            genai.Ptr[float32](50),
 		},
 	)
 
-	// "nomic-embed-text:v1.5" dim 768
-	// "embeddinggemma:300m" dim 768
-	embedder := ollamaPlugin.DefineEmbedder(g, OLLAMA_HOST, "qwen3-embedding:0.6b", nil)
+	embedder := ollamaPlugin.DefineEmbedder(g, OLLAMA_HOST, "embeddinggemma", nil)
 
 	// PGMemory
 	db, err := sql.Open("postgres", CONN_STRING)
@@ -81,21 +82,20 @@ func main() {
 		panic(err)
 	}
 
-	historyProvider, err := pgmemory.NewHistoryProvider(db)
+	historyMemory, err := pgmemory.NewHistoryMemory("history", db)
 	if err != nil {
 		panic(err)
 	}
 
-	knowledgeProvider, err := pgmemory.NewKnowledgeProvider(
+	knowledgeProvider, err := pgmemory.NewKnowledgeMemory(
 		g,
 		db,
-		pgmemory.KnowledgeProviderConfig{
+		pgmemory.KnowledgeMemoryConfig{
 			Name: "knowledge",
-			Description: "USE THIS TOOL when the user asks about specific errors, 'Err...' constants, " +
-				"or unexpected behaviors in the Agens framework. It returns official " +
-				"definitions and step-by-step solutions for debugging.",
+			Description: "USE THIS TOOL when the user asks for information about errors in the agens framework;" +
+				" it returns definitions of the errors.",
 			Embedder:   embedder,
-			Dimensions: 1024,
+			Dimensions: 768,
 		},
 	)
 
@@ -105,22 +105,19 @@ func main() {
 
 	// Agent
 	e21, err := agens.NewAgent(g, agens.AgentConfig{
+		ID:          "agent02",
 		Name:        "e21",
 		Description: "General purpose virtual assistant for developers.",
 		Instructions: []string{
 			"You receive messages from users via a Telegram bot.",
-			"If the user mentions an agens error, use the “e21_knowledge_tool” tool to find the definition.",
 			"Do not assume or invent errors; always consult the error knowledge tool.",
 			"Explain the error clearly and suggest a fix based on the documentation found.",
 		},
-		Model: model,
-		Batcher: &timedbatcher.TimedBatcher{
-			Duration: 5 * time.Second,
-		},
-		HistoryProvider:            historyProvider,
-		MaxMessagesPerConversation: 5,
-		KnowledgeProvider:          knowledgeProvider,
-		KnowledgeRetrieveLimit:     1,
+		Model:                  model,
+		HistoryMemory:          historyMemory,
+		HistoryMemorySize:      5,
+		KnowledgeMemory:        knowledgeProvider,
+		KnowledgeRetrieveLimit: 1,
 	})
 
 	if err != nil {
@@ -139,6 +136,7 @@ func main() {
 
 	// Telegram bot trigger
 	tgTrigger, err := tgbot.NewTrigger(
+		"tgbot02",
 		TGBOT_TOKEN,
 		&tgbot.TriggerOpts{
 			DispatcherOpts: &ext.DispatcherOpts{
@@ -168,7 +166,13 @@ func main() {
 		panic(err)
 	}
 
-	if err := tgTrigger.Start(ctx); err != nil {
+	batcher := &timedbatcher.TimedBatcher{Duration: 5 * time.Second}
+	if err := tgTrigger.WithBatcher(batcher); err != nil {
+		panic(err)
+	}
+
+	// start
+	if err := tgbot.StartPolling(tgTrigger); err != nil {
 		panic(err)
 	}
 	fmt.Printf("%s has been started...\n", tgTrigger.Bot.User.Username)

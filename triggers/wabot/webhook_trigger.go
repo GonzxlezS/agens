@@ -1,9 +1,11 @@
 package wabot
 
 import (
+	"errors"
 	"log/slog"
 	"net/http"
 	"os"
+	"strings"
 
 	"github.com/gonzxlezs/agens"
 
@@ -12,36 +14,58 @@ import (
 	"github.com/wapikit/wapi.go/pkg/events"
 )
 
-const (
-	TriggerName = "WABot"
-
-	DefaultSubPath = "/wabot/"
-)
+const DefaultSubPath = "/wabot/"
 
 var _ agens.WebhookTrigger = &WebhookTrigger{}
 
+var ErrEmptyTriggerID = errors.New("trigger id cannot be empty")
+
 type WebhookTrigger struct {
+	TriggerID string
+
 	Client  *wapi.Client
 	Echo    *echo.Echo
 	Logger  *slog.Logger
 	SubPath string
+
+	Agent   *agens.Agent
+	Batcher agens.MessageBatcher
 }
 
-func NewWebhookTrigger(config *wapi.ClientConfig) *WebhookTrigger {
-	return &WebhookTrigger{
-		Client:  wapi.New(config),
-		Echo:    echo.New(),
-		Logger:  slog.New(slog.NewTextHandler(os.Stdout, nil)),
-		SubPath: DefaultSubPath,
+func NewWebhookTrigger(triggerID string, config *wapi.ClientConfig) (*WebhookTrigger, error) {
+	triggerID = strings.TrimSpace(triggerID)
+	if triggerID == "" {
+		return nil, ErrEmptyTriggerID
 	}
+
+	trigger := &WebhookTrigger{
+		TriggerID: triggerID,
+		Client:    wapi.New(config),
+		Echo:      echo.New(),
+		Logger:    slog.New(slog.NewTextHandler(os.Stdout, nil)),
+		SubPath:   DefaultSubPath,
+	}
+
+	trigger.Client.On(events.TextMessageEventType, trigger.TextHandler)
+
+	return trigger, nil
+}
+
+func (trigger *WebhookTrigger) ID() string {
+	return trigger.TriggerID
 }
 
 func (trigger *WebhookTrigger) Name() string {
-	return TriggerName
+	return "WABot"
 }
 
 func (trigger *WebhookTrigger) RegisterAgent(agent *agens.Agent) error {
-	trigger.Client.On(events.TextMessageEventType, trigger.TextHandler(agent))
+	trigger.Agent = agent
+	return nil
+}
+
+func (trigger *WebhookTrigger) WithBatcher(batcher agens.MessageBatcher) error {
+	trigger.Batcher = batcher
 	return nil
 }
 
@@ -64,10 +88,6 @@ func (trigger *WebhookTrigger) GetRoutes() []agens.WebhookTriggerRoute {
 			Handler: wrapHandler(trigger.Echo, postHandler),
 		},
 	}
-}
-
-func (_ *WebhookTrigger) SetWebhook(_ string) error {
-	return nil
 }
 
 func wrapHandler(e *echo.Echo, handler echo.HandlerFunc) http.HandlerFunc {

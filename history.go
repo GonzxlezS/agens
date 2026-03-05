@@ -6,27 +6,18 @@ import (
 	"github.com/firebase/genkit/go/ai"
 )
 
-// HistoryProvider defines an interface for providing history memory instances
-// tailored for specific agents.
-type HistoryProvider interface {
-	// ForAgent initializes or retrieves a HistoryMemory implementation for the
-	// specified agentName, limiting the history to maxMessagesPerConversation if applicable.
-	ForAgent(agentName string, maxMessagesPerConversation int) (HistoryMemory, error)
-}
-
-// HistoryMemory is an interface for managing the history of a conversation.
+// HistoryMemory defines the operations for persisting and retrieving
+// chat message history between an agent and session.
 type HistoryMemory interface {
-	// RetrieveHistory fetches the history of messages for a given conversationID.
-	// It should return the messages in chronological order.
-	RetrieveHistory(ctx context.Context, conversationID string) ([]*ai.Message, error)
+	// RetrieveHistory fetches the chronological sequence of messages for a specific
+	// session and agent. Returns an empty slice if no history is found.
+	RetrieveHistory(ctx context.Context, agentID string, sessionID string) ([]*ai.Message, error)
 
-	// StoreHistory persists the given messages for a specific conversationID.
-	// Implementations should handle adding new messages to the existing history.
-	StoreHistory(ctx context.Context, conversationID string, messages []*ai.Message) error
+	// StoreHistory persists a set of messages into the session storage.
+	// It applies a retention policy based on maxMessages, typically keeping
+	// only the most recent N messages to optimize context window usage.
+	StoreHistory(ctx context.Context, agentID string, sessionID string, messages []*ai.Message, maxMessages int) error
 
-	// DeleteHistory removes the entire conversation history associated with a conversationID.
-	DeleteHistory(ctx context.Context, conversationID string) error
-
-	// Close performs any necessary cleanup, such as closing database connections.
-	Close() error
+	// DeleteHistory removes all messages and metadata associated with a specific session.
+	DeleteHistory(ctx context.Context, agentID string, sessionID string) error
 }

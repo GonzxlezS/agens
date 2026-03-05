@@ -6,7 +6,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"strings"
 
 	"github.com/firebase/genkit/go/ai"
 	"github.com/firebase/genkit/go/core/api"
@@ -20,20 +19,81 @@ const Provider = "pgmemory"
 const (
 	TableNameFormat = "knowledge_embeddings_%d"
 
-	DeleteByLabelQueryFormat = `DELETE FROM %s WHERE agent_name = $1 AND embedder_name = $2 AND label = $3`
+	CreateKnowledgeEmbeddingsQueryFormat = `CREATE EXTENSION IF NOT EXISTS vector;
+	CREATE TABLE IF NOT EXISTS %s (
+		id SERIAL PRIMARY KEY,
+        agent_id TEXT NOT NULL,
+        embedder_name TEXT NOT NULL,
+		label TEXT NOT NULL,
+        content TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        embedding vector(%d) NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )`
+
+	CreateKnowledgeLabelIndexQueryFormat = `CREATE INDEX IF NOT EXISTS idx_%s_label ON %s (agent_id, embedder_name, label)`
+
+	CreateKnowledgeHashIndexQueryFormat = `CREATE INDEX IF NOT EXISTS idx_%s_hash ON %s (agent_id, embedder_name, content_hash)`
+
+	CreateKnowledgeIvfflatIndexQueryFormat = `CREATE INDEX IF NOT EXISTS idx_%s_ivfflat ON %s USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100)`
+)
+
+const (
+	CheckKnowledgeSchemaQueryFormat = `DO $$
+	DECLARE
+		mismatch RECORD;
+	BEGIN
+		FOR mismatch IN
+			WITH expected_layout AS (
+				SELECT * FROM (VALUES 
+					('id', 'int4'),
+					('agent_id', 'text'),
+					('embedder_name', 'text'),
+					('label', 'text'),			
+					('content', 'text'),
+					('content_hash', 'text'),
+					('embedding', 'vector'),
+					('created_at', 'timestamptz')
+				) AS t(col_name, col_type)
+			),
+			current_layout AS (
+				SELECT column_name, udt_name 
+				FROM information_schema.columns 
+				WHERE table_name = '%s' AND table_schema = 'public'
+			)
+			SELECT 
+				e.col_name,
+				CASE 
+					WHEN c.column_name IS NULL 
+						THEN 'MISSING COLUMN'
+					WHEN e.col_type != c.udt_name 
+						THEN 'INVALID TYPE (expected ' || e.col_type || ', found ' || c.udt_name || ')'
+					ELSE NULL
+				END as error_msg
+			FROM expected_layout e
+			LEFT JOIN current_layout c ON e.col_name = c.column_name
+			WHERE c.column_name IS NULL OR e.col_type != c.udt_name
+		LOOP
+			RAISE EXCEPTION '%%: %%', mismatch.col_name, mismatch.error_msg;
+		END LOOP;
+	END $$;`
+)
+
+const (
+	DeleteByLabelQueryFormat = `DELETE FROM %s WHERE agent_id = $1 AND embedder_name = $2 AND label = $3`
 
 	IndexKnowledgeQueryFormat = `INSERT INTO %s (
-	agent_name, 
-	embedder_name,
-	label, 
-	content,
-	content_hash,
-	embedding
+		agent_id, 
+		embedder_name,
+		label, 
+		content,
+		content_hash,
+		embedding
 	) VALUES ($1, $2, $3, $4, $5, $6)`
 
 	IsIndexedQueryFormat = `SELECT EXISTS(
         SELECT 1 FROM %s 
-            WHERE agent_name = $1 
+            WHERE agent_id = $1 
             AND embedder_name = $2
             AND label = $3
             AND content_hash = $4
@@ -41,77 +101,33 @@ const (
 
 	RetrieveKnowledgeQueryFormat = `SELECT label, content 
     FROM %s 
-    WHERE agent_name = $1 
-      AND embedder_name = $2
+    WHERE agent_id = $1 AND embedder_name = $2
     ORDER BY embedding <#> $3 LIMIT $4`
-)
-
-const (
-	StatusKnowledgeSuccess = "success"
-
-	StatusKnowledgeNoResults = "no_results"
 )
 
 const labelKey = "label"
 
-var (
-	ErrDimensionNotSupported = errors.New("pgmemory: dimension not supported")
+var ErrInvalidRetrieveOptions = errors.New("pgmemory: invalid or missing retrieval options")
 
-	ErrKnowledgeProviderFailure = fmt.Errorf("pgmemory: knowledge provider failure")
-
-	ErrInvalidRetrieveOptions = errors.New("pgmemory: invalid or missing retrieval options")
-)
-
-var _ agens.KnowledgeProvider = &KnowledgeProvider{}
-var _ agens.KnowledgeMemory = &knowledgeMemory{}
-
-var supportedDimensions = map[int]struct{}{
-	384:  {},
-	768:  {},
-	1024: {},
-	1536: {},
-}
-
-type (
-	KnowledgeQuery struct {
-		Query string `json:"query" jsonschema_description:"The specific search query or keywords to retrieve relevant information from the knowledge base. Should be clear and focused on the topic."`
-	}
-
-	DocumentResult struct {
-		Label   string `json:"label" jsonschema_description:"The category or source label of the retrieved document."`
-		Content string `json:"content" jsonschema_description:"The text content of the retrieved document."`
-	}
-
-	KnowledgeResponse struct {
-		Results []DocumentResult `json:"results" jsonschema_description:"List of relevant documents found."`
-		Count   int              `json:"count" jsonschema_description:"Number of documents retrieved. 0 if nothing was found."`
-		Status  string           `json:"status" jsonschema:"enum=success,enum=,description=The outcome of the retrieval operation."`
-	}
-)
+var _ agens.KnowledgeMemory = &KnowledgeMemory{}
 
 type RetrieveOptions struct {
-	AgentName string
-	Limit     int
+	AgentID string
+	Limit   int
 }
 
-type KnowledgeProviderConfig struct {
-	Name             string
-	Description      string
-	Embedder         ai.Embedder
-	EmbedderName     string
-	Dimensions       int
+type KnowledgeMemoryConfig struct {
+	Name        string
+	Description string
+
+	Embedder   ai.Embedder
+	Dimensions int
+
 	RetrieverOptions *ai.RetrieverOptions
 	EmbedderOptions  []ai.EmbedderOption
 }
 
-func (cfg *KnowledgeProviderConfig) resolveEmbedderName() string {
-	if cfg.Embedder != nil {
-		return cfg.Embedder.Name()
-	}
-	return cfg.EmbedderName
-}
-
-func (cfg *KnowledgeProviderConfig) resolveEmbedderOptions(additionalOptions ...ai.EmbedderOption) []ai.EmbedderOption {
+func (cfg *KnowledgeMemoryConfig) getEmbedderOptions(additionalOptions ...ai.EmbedderOption) []ai.EmbedderOption {
 	embedderOpts := make([]ai.EmbedderOption, 0, len(cfg.EmbedderOptions)+len(additionalOptions)+1)
 
 	embedderOpts = append(embedderOpts, cfg.EmbedderOptions...)
@@ -119,70 +135,89 @@ func (cfg *KnowledgeProviderConfig) resolveEmbedderOptions(additionalOptions ...
 
 	if cfg.Embedder != nil {
 		embedderOpts = append(embedderOpts, ai.WithEmbedder(cfg.Embedder))
-	} else if cfg.EmbedderName != "" {
-		embedderOpts = append(embedderOpts, ai.WithEmbedderName(cfg.EmbedderName))
 	}
-
 	return embedderOpts
 }
 
-type KnowledgeProvider struct {
+type KnowledgeMemory struct {
 	g   *genkit.Genkit
 	db  *sql.DB
-	cfg *KnowledgeProviderConfig
+	cfg *KnowledgeMemoryConfig
 
 	tableName string
 	retriever ai.Retriever
 }
 
-func NewKnowledgeProvider(g *genkit.Genkit, db *sql.DB, cfg KnowledgeProviderConfig) (*KnowledgeProvider, error) {
-	tableName, err := getTableName(cfg.Dimensions)
-	if err != nil {
-		return nil, err
-	}
+func NewKnowledgeMemory(g *genkit.Genkit, db *sql.DB, cfg KnowledgeMemoryConfig) (*KnowledgeMemory, error) {
+	tableName := fmt.Sprintf(TableNameFormat, cfg.Dimensions)
 
 	if err := db.Ping(); err != nil {
 		return nil, err
 	}
 
-	if err := runModuleMigration(db, "knowledge", "migrations_knowledge"); err != nil {
-		return nil, fmt.Errorf("knowledge migrations failed: %w", err)
+	tx, err := db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("error starting transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	// table
+	query := fmt.Sprintf(CreateKnowledgeEmbeddingsQueryFormat, tableName, cfg.Dimensions)
+	if _, err := tx.ExecContext(context.Background(), query); err != nil {
+		return nil, fmt.Errorf("error creating table: %w", err)
 	}
 
-	retriever := defineRetriever(g, db, tableName, &cfg)
+	// check
+	query = fmt.Sprintf(CheckKnowledgeSchemaQueryFormat, tableName)
+	if _, err := tx.ExecContext(context.Background(), query); err != nil {
+		return nil, err
+	}
 
-	return &KnowledgeProvider{
+	// index
+	query = fmt.Sprintf(CreateKnowledgeLabelIndexQueryFormat, tableName, tableName)
+	if _, err := tx.ExecContext(context.Background(), query); err != nil {
+		return nil, fmt.Errorf("error creating index: %w", err)
+	}
+
+	query = fmt.Sprintf(CreateKnowledgeHashIndexQueryFormat, tableName, tableName)
+	if _, err := tx.ExecContext(context.Background(), query); err != nil {
+		return nil, fmt.Errorf("error creating index: %w", err)
+	}
+
+	query = fmt.Sprintf(CreateKnowledgeIvfflatIndexQueryFormat, tableName, tableName)
+	if _, err := tx.ExecContext(context.Background(), query); err != nil {
+		return nil, fmt.Errorf("error creating index: %w", err)
+	}
+
+	// KnowledgeMemory
+	return &KnowledgeMemory{
 		g:         g,
 		db:        db,
 		cfg:       &cfg,
 		tableName: tableName,
-		retriever: retriever,
-	}, nil
+		retriever: defineRetriever(g, db, tableName, &cfg),
+	}, tx.Commit()
 }
 
-func (p *KnowledgeProvider) ForAgent(agentName string, limit int) (agens.KnowledgeMemory, error) {
-	return &knowledgeMemory{
-		provider:  p,
-		agentName: agentName,
-		asTool:    defineTool(p.g, p.retriever, p.cfg, agentName, limit),
-	}, nil
+func (m *KnowledgeMemory) AsTool(agentID string, limit int) ai.Tool {
+	return defineTool(m.g, m.retriever, m.cfg, agentID, limit)
 }
 
-func (p *KnowledgeProvider) deleteKnowledge(ctx context.Context, agentName string, label string) error {
-	if p.db == nil {
+func (m *KnowledgeMemory) DeleteKnowledge(ctx context.Context, agentID string, label string) error {
+	if m.db == nil {
 		return ErrDBNotInitialized
 	}
 
-	query := fmt.Sprintf(DeleteByLabelQueryFormat, p.tableName)
-	_, err := p.db.ExecContext(ctx, query, agentName, p.cfg.resolveEmbedderName(), label)
+	query := fmt.Sprintf(DeleteByLabelQueryFormat, m.tableName)
+	_, err := m.db.ExecContext(ctx, query, agentID, m.cfg.Embedder.Name(), label)
 	if err != nil {
 		return fmt.Errorf("error deleting knowledge: %w", err)
 	}
 	return nil
 }
 
-func (p *KnowledgeProvider) indexKnowledge(ctx context.Context, agentName string, label string, docs []*ai.Document) error {
-	if p.db == nil {
+func (m *KnowledgeMemory) IndexKnowledge(ctx context.Context, agentID string, label string, docs []*ai.Document) error {
+	if m.db == nil {
 		return ErrDBNotInitialized
 	}
 
@@ -199,7 +234,7 @@ func (p *KnowledgeProvider) indexKnowledge(ctx context.Context, agentName string
 
 		cHash := calculateHash(content)
 
-		exists, err := p.isIndexed(ctx, agentName, label, cHash)
+		exists, err := m.isIndexed(ctx, agentID, label, cHash)
 		if err != nil {
 			return err
 		}
@@ -216,8 +251,8 @@ func (p *KnowledgeProvider) indexKnowledge(ctx context.Context, agentName string
 
 	res, err := genkit.Embed(
 		ctx,
-		p.g,
-		p.cfg.resolveEmbedderOptions(
+		m.g,
+		m.cfg.getEmbedderOptions(
 			ai.WithDocs(docsToEmbed...),
 		)...,
 	)
@@ -227,8 +262,8 @@ func (p *KnowledgeProvider) indexKnowledge(ctx context.Context, agentName string
 	}
 
 	var (
-		query        = fmt.Sprintf(IndexKnowledgeQueryFormat, p.tableName)
-		embedderName = p.cfg.resolveEmbedderName()
+		query        = fmt.Sprintf(IndexKnowledgeQueryFormat, m.tableName)
+		embedderName = m.cfg.Embedder.Name()
 	)
 
 	for i, emb := range res.Embeddings {
@@ -236,7 +271,7 @@ func (p *KnowledgeProvider) indexKnowledge(ctx context.Context, agentName string
 		currentHash := hashesToEmbed[i]
 		embedding := pgv.NewVector(emb.Embedding)
 
-		_, err := p.db.ExecContext(ctx, query, agentName, embedderName, label, content, currentHash, embedding)
+		_, err := m.db.ExecContext(ctx, query, agentID, embedderName, label, content, currentHash, embedding)
 		if err != nil {
 			return err
 		}
@@ -245,38 +280,20 @@ func (p *KnowledgeProvider) indexKnowledge(ctx context.Context, agentName string
 	return nil
 }
 
-func (p *KnowledgeProvider) isIndexed(ctx context.Context, agentName string, label string, content_hash string) (bool, error) {
-	if p.db == nil {
+func (m *KnowledgeMemory) isIndexed(ctx context.Context, agentID string, label string, content_hash string) (bool, error) {
+	if m.db == nil {
 		return false, ErrDBNotInitialized
 	}
 
 	var (
-		query  = fmt.Sprintf(IsIndexedQueryFormat, p.tableName)
+		query  = fmt.Sprintf(IsIndexedQueryFormat, m.tableName)
 		exists bool
 	)
-	err := p.db.QueryRowContext(ctx, query, agentName, p.cfg.resolveEmbedderName(), label, content_hash).Scan(&exists)
+	err := m.db.QueryRowContext(ctx, query, agentID, m.cfg.Embedder.Name(), label, content_hash).Scan(&exists)
 	if err != nil {
 		return false, fmt.Errorf("database error: %v", err)
 	}
 	return exists, nil
-}
-
-type knowledgeMemory struct {
-	provider  *KnowledgeProvider
-	asTool    ai.Tool
-	agentName string
-}
-
-func (k *knowledgeMemory) AsTool() ai.Tool {
-	return k.asTool
-}
-
-func (k *knowledgeMemory) DeleteKnowledge(ctx context.Context, label string) error {
-	return k.provider.deleteKnowledge(ctx, k.agentName, label)
-}
-
-func (k *knowledgeMemory) IndexKnowledge(ctx context.Context, label string, docs []*ai.Document) error {
-	return k.provider.indexKnowledge(ctx, k.agentName, label, docs)
 }
 
 func calculateHash(content string) string {
@@ -285,7 +302,7 @@ func calculateHash(content string) string {
 	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
-func defineRetriever(g *genkit.Genkit, db *sql.DB, tableName string, cfg *KnowledgeProviderConfig) ai.Retriever {
+func defineRetriever(g *genkit.Genkit, db *sql.DB, tableName string, cfg *KnowledgeMemoryConfig) ai.Retriever {
 	f := func(ctx context.Context, req *ai.RetrieverRequest) (*ai.RetrieverResponse, error) {
 		opts, ok := req.Options.(*RetrieveOptions)
 		if !ok || opts == nil {
@@ -300,7 +317,7 @@ func defineRetriever(g *genkit.Genkit, db *sql.DB, tableName string, cfg *Knowle
 		eres, err := genkit.Embed(
 			ctx,
 			g,
-			cfg.resolveEmbedderOptions(ai.WithDocs(req.Query))...,
+			cfg.getEmbedderOptions(ai.WithDocs(req.Query))...,
 		)
 
 		if err != nil {
@@ -311,8 +328,8 @@ func defineRetriever(g *genkit.Genkit, db *sql.DB, tableName string, cfg *Knowle
 		rows, err := db.QueryContext(
 			ctx,
 			query,
-			opts.AgentName,
-			cfg.resolveEmbedderName(),
+			opts.AgentID,
+			cfg.Embedder.Name(),
 			pgv.NewVector(eres.Embeddings[0].Embedding),
 			opts.Limit,
 		)
@@ -341,73 +358,4 @@ func defineRetriever(g *genkit.Genkit, db *sql.DB, tableName string, cfg *Knowle
 	}
 
 	return genkit.DefineRetriever(g, api.NewName(Provider, cfg.Name), cfg.RetrieverOptions, f)
-}
-
-func defineTool(g *genkit.Genkit, retriever ai.Retriever, cfg *KnowledgeProviderConfig, agentName string, limit int) ai.Tool {
-	toolName := fmt.Sprintf("%s_%s_tool", agentName, cfg.Name)
-
-	f := func(ctx *ai.ToolContext, query KnowledgeQuery) (KnowledgeResponse, error) {
-		resp, err := genkit.Retrieve(
-			ctx, g,
-			ai.WithRetriever(retriever),
-			ai.WithConfig(&RetrieveOptions{
-				AgentName: agentName,
-				Limit:     limit,
-			}),
-			ai.WithTextDocs(query.Query),
-		)
-		if err != nil {
-			return KnowledgeResponse{}, errors.Join(ErrKnowledgeProviderFailure, err)
-		}
-
-		kResponse := KnowledgeResponse{
-			Count:  len(resp.Documents),
-			Status: StatusKnowledgeNoResults,
-		}
-
-		if kResponse.Count < 1 {
-			return kResponse, nil
-		}
-		kResponse.Status = StatusKnowledgeSuccess
-
-		for _, doc := range resp.Documents {
-			label, _ := doc.Metadata[labelKey].(string)
-			if label == "" {
-				label = "unlabeled"
-			}
-
-			kResponse.Results = append(
-				kResponse.Results,
-				DocumentResult{
-					Label:   label,
-					Content: documentToText(doc),
-				},
-			)
-		}
-		return kResponse, nil
-	}
-
-	return genkit.DefineTool(g, toolName, cfg.Description, f)
-}
-
-func documentToText(doc *ai.Document) string {
-	var b strings.Builder
-	for _, part := range doc.Content {
-		b.WriteString(part.Text)
-		b.WriteString("\n")
-	}
-	return b.String()
-}
-
-func getTableName(dim int) (string, error) {
-	if _, ok := supportedDimensions[dim]; !ok {
-		dims := make([]string, 0, len(supportedDimensions))
-		for d := range supportedDimensions {
-			dims = append(dims, fmt.Sprintf("%d", d))
-		}
-
-		return "", fmt.Errorf("%w. Supported: [%s]", ErrDimensionNotSupported, strings.Join(dims, ", "))
-	}
-
-	return fmt.Sprintf(TableNameFormat, dim), nil
 }

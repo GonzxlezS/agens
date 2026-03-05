@@ -23,14 +23,14 @@ type WebhookTriggerOpts struct {
 }
 
 type WebhookTrigger struct {
-	BaseTrigger *Trigger
+	*Trigger
 
 	SubPath        string
 	SecretToken    string
 	SetWebhookOpts *gotgbot.SetWebhookOpts
 }
 
-func NewWebhookTrigger(token string, opts *WebhookTriggerOpts) (*WebhookTrigger, error) {
+func NewWebhookTrigger(triggerID string, token string, opts *WebhookTriggerOpts) (*WebhookTrigger, error) {
 	var (
 		trigger = &WebhookTrigger{}
 		err     error
@@ -40,7 +40,7 @@ func NewWebhookTrigger(token string, opts *WebhookTriggerOpts) (*WebhookTrigger,
 		opts = &WebhookTriggerOpts{}
 	}
 
-	trigger.BaseTrigger, err = NewTrigger(token, &TriggerOpts{
+	trigger.Trigger, err = NewTrigger(triggerID, token, &TriggerOpts{
 		BotOpts:        opts.BotOpts,
 		DispatcherOpts: opts.DispatcherOpts,
 		UpdaterOpts:    opts.UpdaterOpts,
@@ -63,18 +63,18 @@ func NewWebhookTrigger(token string, opts *WebhookTriggerOpts) (*WebhookTrigger,
 }
 
 func (trigger *WebhookTrigger) Name() string {
-	return trigger.BaseTrigger.Name() + "Webhook"
+	return trigger.Trigger.Name() + "Webhook"
 }
 
 func (trigger *WebhookTrigger) RegisterAgent(agent *agens.Agent) error {
-	err := trigger.BaseTrigger.RegisterAgent(agent)
+	err := trigger.Trigger.RegisterAgent(agent)
 	if err != nil {
 		return err
 	}
 
-	return trigger.BaseTrigger.Updater.AddWebhook(
-		trigger.BaseTrigger.Bot,
-		trigger.BaseTrigger.Bot.Token,
+	return trigger.Updater.AddWebhook(
+		trigger.Bot,
+		trigger.Bot.Token,
 		&ext.AddWebhookOpts{
 			SecretToken: trigger.SecretToken,
 		},
@@ -86,20 +86,7 @@ func (trigger *WebhookTrigger) GetRoutes() []agens.WebhookTriggerRoute {
 		{
 			Method:  http.MethodPost,
 			Path:    trigger.SubPath,
-			Handler: trigger.BaseTrigger.Updater.GetHandlerFunc(trigger.SubPath),
+			Handler: trigger.Updater.GetHandlerFunc(trigger.SubPath),
 		},
 	}
-}
-
-func (trigger *WebhookTrigger) SetWebhook(baseURL string) error {
-	if trigger.SetWebhookOpts == nil {
-		trigger.SetWebhookOpts = &gotgbot.SetWebhookOpts{}
-	}
-
-	trigger.SetWebhookOpts.SecretToken = trigger.SecretToken
-
-	return trigger.BaseTrigger.Updater.SetAllBotWebhooks(
-		baseURL+trigger.SubPath,
-		trigger.SetWebhookOpts,
-	)
 }

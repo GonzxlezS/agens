@@ -18,6 +18,8 @@ import (
 	"github.com/gonzxlezs/agens/triggers/tgbot"
 	_ "github.com/lib/pq"
 	"google.golang.org/genai"
+
+	_ "github.com/joho/godotenv/autoload"
 )
 
 func main() {
@@ -64,24 +66,22 @@ func main() {
 		panic(err)
 	}
 
-	pgm, err := pgmemory.NewHistoryProvider(db)
+	historyMemory, err := pgmemory.NewHistoryMemory("history", db)
 	if err != nil {
 		panic(err)
 	}
 
 	// Agent
 	e21, err := agens.NewAgent(g, agens.AgentConfig{
+		ID:          "agent01",
 		Name:        "e21",
 		Description: "a general-purpose virtual assistant",
 		Instructions: []string{
 			"You receive messages from users via a Telegram bot and must respond to their messages.",
 		},
-		Model: model,
-		Batcher: &timedbatcher.TimedBatcher{
-			Duration: 5 * time.Second,
-		},
-		HistoryProvider:            pgm,
-		MaxMessagesPerConversation: 5,
+		Model:             model,
+		HistoryMemory:     historyMemory,
+		HistoryMemorySize: 5,
 	})
 
 	if err != nil {
@@ -90,6 +90,7 @@ func main() {
 
 	// Telegram bot trigger
 	tgTrigger, err := tgbot.NewTrigger(
+		"tgbot01",
 		TGBOT_TOKEN,
 		&tgbot.TriggerOpts{
 			DispatcherOpts: &ext.DispatcherOpts{
@@ -119,7 +120,13 @@ func main() {
 		panic(err)
 	}
 
-	if err := tgTrigger.Start(ctx); err != nil {
+	batcher := &timedbatcher.TimedBatcher{Duration: 5 * time.Second}
+	if err := tgTrigger.WithBatcher(batcher); err != nil {
+		panic(err)
+	}
+
+	// start
+	if err := tgbot.StartPolling(tgTrigger); err != nil {
 		panic(err)
 	}
 	fmt.Printf("%s has been started...\n", tgTrigger.Bot.User.Username)

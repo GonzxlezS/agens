@@ -1,16 +1,20 @@
 package tgbot
 
 import (
-	"context"
-	"fmt"
+	"errors"
+	"strings"
 
 	"github.com/gonzxlezs/agens"
 
 	"github.com/PaulSonOfLars/gotgbot/v2"
 	"github.com/PaulSonOfLars/gotgbot/v2/ext"
+	"github.com/PaulSonOfLars/gotgbot/v2/ext/handlers"
+	"github.com/PaulSonOfLars/gotgbot/v2/ext/handlers/filters/message"
 )
 
 var _ agens.Trigger = &Trigger{}
+
+var ErrEmptyTriggerID = errors.New("trigger id cannot be empty")
 
 type TriggerOpts struct {
 	BotOpts        *gotgbot.BotOpts
@@ -21,17 +25,30 @@ type TriggerOpts struct {
 }
 
 type Trigger struct {
+	TriggerID string
+
 	Bot        *gotgbot.Bot
 	Dispatcher *ext.Dispatcher
 	Updater    *ext.Updater
 
 	PollingOpts *ext.PollingOpts
+
+	Agent   *agens.Agent
+	Batcher agens.MessageBatcher
 }
 
-func NewTrigger(token string, opts *TriggerOpts) (*Trigger, error) {
+func NewTrigger(triggerID string, token string, opts *TriggerOpts) (*Trigger, error) {
+	triggerID = strings.TrimSpace(triggerID)
+	if triggerID == "" {
+		return nil, ErrEmptyTriggerID
+	}
+
 	var (
-		trigger = &Trigger{}
-		err     error
+		trigger = &Trigger{
+			TriggerID: triggerID,
+		}
+
+		err error
 	)
 
 	if opts == nil {
@@ -44,6 +61,7 @@ func NewTrigger(token string, opts *TriggerOpts) (*Trigger, error) {
 	}
 
 	trigger.Dispatcher = ext.NewDispatcher(opts.DispatcherOpts)
+	trigger.Dispatcher.AddHandler(handlers.NewMessage(message.Text, trigger.TextHandler))
 
 	trigger.Updater = ext.NewUpdater(trigger.Dispatcher, opts.UpdaterOpts)
 
@@ -52,23 +70,20 @@ func NewTrigger(token string, opts *TriggerOpts) (*Trigger, error) {
 	return trigger, nil
 }
 
+func (trigger *Trigger) ID() string {
+	return trigger.TriggerID
+}
+
 func (trigger *Trigger) Name() string {
 	return "TelegramBot"
 }
 
 func (trigger *Trigger) RegisterAgent(agent *agens.Agent) error {
-	trigger.Dispatcher.AddHandler(trigger.TextHandler(agent))
+	trigger.Agent = agent
 	return nil
 }
 
-func (trigger *Trigger) Start(_ context.Context) error {
-	err := trigger.Updater.StartPolling(trigger.Bot, trigger.PollingOpts)
-	if err != nil {
-		return fmt.Errorf("failed to start polling: %w", err)
-	}
+func (trigger *Trigger) WithBatcher(batcher agens.MessageBatcher) error {
+	trigger.Batcher = batcher
 	return nil
-}
-
-func (trigger *Trigger) Stop(_ context.Context) error {
-	return trigger.Updater.Stop()
 }

@@ -1,6 +1,8 @@
 package timedbatcher
 
 import (
+	"context"
+	"errors"
 	"sync"
 	"time"
 
@@ -11,6 +13,12 @@ import (
 
 var _ agens.MessageBatcher = &TimedBatcher{}
 
+var (
+	ErrEmptyBatchID = errors.New("batch id cannot be empty")
+
+	ErrNilMessage = errors.New("message cannot be nil")
+)
+
 type TimedBatcher struct {
 	Duration time.Duration
 
@@ -18,7 +26,13 @@ type TimedBatcher struct {
 	channels map[string]chan *ai.Message
 }
 
-func (b *TimedBatcher) Add(conversationID string, msg *ai.Message) ([]*ai.Message, error) {
+func (b *TimedBatcher) Add(_ context.Context, batchID string, msg *ai.Message) ([]*ai.Message, error) {
+	if batchID == "" {
+		return nil, ErrEmptyBatchID
+	} else if msg == nil {
+		return nil, ErrNilMessage
+	}
+
 	b.mu.Lock()
 	if b.channels == nil {
 		b.channels = make(map[string]chan *ai.Message)
@@ -26,13 +40,13 @@ func (b *TimedBatcher) Add(conversationID string, msg *ai.Message) ([]*ai.Messag
 
 	var out chan []*ai.Message
 
-	ch, ok := b.channels[conversationID]
+	ch, ok := b.channels[batchID]
 	if !ok {
 		ch = make(chan *ai.Message, 100)
-		b.channels[conversationID] = ch
+		b.channels[batchID] = ch
 
 		out = make(chan []*ai.Message)
-		go b.start(conversationID, ch, out)
+		go b.start(batchID, ch, out)
 	}
 
 	ch <- msg
@@ -44,7 +58,7 @@ func (b *TimedBatcher) Add(conversationID string, msg *ai.Message) ([]*ai.Messag
 	return <-out, nil
 }
 
-func (b *TimedBatcher) start(conversationID string, ch chan *ai.Message, out chan []*ai.Message) {
+func (b *TimedBatcher) start(batchID string, ch chan *ai.Message, out chan []*ai.Message) {
 	var (
 		batch []*ai.Message
 		timer = time.NewTimer(b.Duration)
@@ -52,7 +66,7 @@ func (b *TimedBatcher) start(conversationID string, ch chan *ai.Message, out cha
 
 	defer func() {
 		b.mu.Lock()
-		delete(b.channels, conversationID)
+		delete(b.channels, batchID)
 		close(ch)
 		b.mu.Unlock()
 

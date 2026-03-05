@@ -6,19 +6,11 @@ package agens
 import (
 	"context"
 	"errors"
+	"strings"
 
 	"github.com/firebase/genkit/go/ai"
 	"github.com/firebase/genkit/go/core"
 	"github.com/firebase/genkit/go/genkit"
-)
-
-const (
-	// DelegationMessage is a text message that accompanies the FinishReasonDelegated finish reason.
-	DelegationMessage = "The message has been delegated to another flow for handling."
-
-	// FinishReasonDelegated is a custom finish reason indicating that the message
-	// was delegated to another flow or component for handling.
-	FinishReasonDelegated ai.FinishReason = "delegated"
 )
 
 var (
@@ -26,101 +18,101 @@ var (
 	// that has not been properly initialized.
 	ErrAgentNotInitialized = errors.New("agent not initialized")
 
+	// ErrEmptyAgentDescription indicates that the agent's purpose or metadata
+	// is missing, which is required for registration.
+	ErrEmptyAgentDescription = errors.New("agent description cannot be empty")
+
+	// ErrEmptyAgentID indicates that the unique identifier for the agent
+	// is missing or contains only whitespace.
+	ErrEmptyAgentID = errors.New("agent id cannot be empty")
+
+	// ErrEmptyAgentInstructions indicates that the system prompts or core
+	// logic guidelines for the agent have not been provided.
+	ErrEmptyAgentInstructions = errors.New("agent instructions cannot be empty")
+
+	// ErrEmptyAgentName indicates that the human-readable name for the
+	// agent is missing.
+	ErrEmptyAgentName = errors.New("agent name cannot be empty")
+
 	// ErrKnowledgeMemoryNotConfigured is returned when an operation is attempted
 	// on an agent that does not have a KnowledgeMemory initialized.
 	ErrKnowledgeMemoryNotConfigured = errors.New("knowledge memory is not configured for this agent")
 )
 
-// Agent represents a generic AI agent that encapsulates execution logic (flow).
+// Agent represents a high-level Genkit execution unit that orchestrates
+// configurations, flows, and knowledge memory.
 type Agent struct {
-	config          *AgentConfig
-	knowledgeMemory KnowledgeMemory
-	historyMemory   HistoryMemory
-
-	flow *core.Flow[*ai.Message, *ai.ModelResponse, struct{}]
+	cfg  *AgentConfig
+	flow *core.Flow[*Input, *ai.ModelResponse, struct{}]
 }
 
-// NewAgent initializes a new Agent instance. It defines a Genkit flow based on the provided AgentConfig.
+// NewAgent initializes a new Agent instance.
 func NewAgent(g *genkit.Genkit, cfg AgentConfig) (*Agent, error) {
-	var (
-		agent = &Agent{config: &cfg}
-		err   error
-	)
-
-	// history memory
-	if cfg.HistoryProvider != nil {
-		agent.historyMemory, err = cfg.HistoryProvider.ForAgent(cfg.Name, cfg.MaxMessagesPerConversation)
-		if err != nil {
-			return nil, err
-		}
+	// id
+	cfg.ID = strings.TrimSpace(cfg.ID)
+	if cfg.ID == "" {
+		return nil, ErrEmptyAgentID
 	}
 
-	// knowledge
-	if cfg.KnowledgeProvider != nil {
-		agent.knowledgeMemory, err = cfg.KnowledgeProvider.ForAgent(cfg.Name, cfg.KnowledgeRetrieveLimit)
-		if err != nil {
-			return nil, err
-		}
-
-		agent.config.Tools = append(
-			agent.config.Tools,
-			agent.knowledgeMemory.AsTool(),
-		)
+	// name
+	cfg.Name = strings.TrimSpace(cfg.Name)
+	if cfg.Name == "" {
+		return nil, ErrEmptyAgentName
 	}
 
-	// flow
-	agent.flow = genkit.DefineFlow(g, cfg.Name, baseFlow(g, &cfg, agent.historyMemory))
+	// description
+	cfg.Description = strings.TrimSpace(cfg.Description)
+	if cfg.Description == "" {
+		return nil, ErrEmptyAgentDescription
+	}
 
-	return agent, nil
+	// instructions
+	if len(cfg.Instructions) == 0 {
+		return nil, ErrEmptyAgentInstructions
+	}
+
+	// agent
+	return &Agent{
+		cfg:  &cfg,
+		flow: genkit.DefineFlow(g, cfg.ID, cfg.flowFn(g)),
+	}, nil
 }
 
-// DeleteKnowledge removes documents associated with a specific label from the agent's memory.
-// It returns ErrKnowledgeMemoryNotConfigured if the agent was not initialized with knowledge capabilities.
-func (agent *Agent) DeleteKnowledge(ctx context.Context, label string) error {
-	if agent.knowledgeMemory == nil {
-		return ErrKnowledgeMemoryNotConfigured
+// ID returns the agent's unique identifier. Returns an empty string if the agent is not configured.
+func (agent *Agent) ID() string {
+	if agent.cfg != nil {
+		return agent.cfg.ID
 	}
-	return agent.knowledgeMemory.DeleteKnowledge(ctx, label)
+	return ""
 }
 
-// IndexKnowledge adds and indexes a set of documents into the agent's memory under a given label.
-// This allows the agent to retrieve this information later during conversations.
-// It returns ErrKnowledgeMemoryNotConfigured if the agent was not initialized with knowledge capabilities.
-func (agent *Agent) IndexKnowledge(ctx context.Context, label string, docs []*ai.Document) error {
-	if agent.knowledgeMemory == nil {
-		return ErrKnowledgeMemoryNotConfigured
-	}
-	return agent.knowledgeMemory.IndexKnowledge(ctx, label, docs)
-}
-
-// Name returns the identifier of the agent defined in its configuration.
-// If the agent or its configuration is nil, it returns an empty string.
-func (agent *Agent) Name() string {
-	if agent == nil || agent.config == nil {
-		return ""
-	}
-	return agent.config.Name
-}
-
-// Run executes the agent's internal flow with a given message within the provided context.
-// It returns a *ai.ModelResponse containing the AI's output or an error if execution fails.
-func (agent *Agent) Run(ctx context.Context, msg *ai.Message) (*ai.ModelResponse, error) {
+// Generate executes the agent's internal Genkit flow with the given input.
+// Returns ErrAgentNotInitialized if the flow is not properly defined.
+func (agent *Agent) Generate(ctx context.Context, input *Input) (*ai.ModelResponse, error) {
 	if agent.flow == nil {
-		return EmptyModelResponse(), ErrAgentNotInitialized
+		return &ai.ModelResponse{}, ErrAgentNotInitialized
 	}
-	return agent.flow.Run(ctx, msg)
+	return agent.flow.Run(ctx, input)
 }
 
-// DelegatedModelResponse creates a model response that indicates the message
-// was delegated. This is useful when an agent decides not to handle a message.
-func DelegatedModelResponse() *ai.ModelResponse {
-	return &ai.ModelResponse{
-		FinishReason:  FinishReasonDelegated,
-		FinishMessage: DelegationMessage,
+// IndexKnowledge persists documents into the agent's knowledge memory using a label.
+// Fails if KnowledgeMemory is not configured in the AgentConfig.
+func (agent *Agent) IndexKnowledge(ctx context.Context, label string, docs []*ai.Document) error {
+	if agent.cfg == nil {
+		return ErrAgentNotInitialized
+	} else if agent.cfg.KnowledgeMemory == nil {
+		return ErrKnowledgeMemoryNotConfigured
 	}
+	return agent.cfg.KnowledgeMemory.IndexKnowledge(ctx, agent.cfg.ID, label, docs)
 }
 
-// EmptyModelResponse creates an empty model response.
-func EmptyModelResponse() *ai.ModelResponse {
-	return &ai.ModelResponse{}
+// DeleteKnowledge removes specific labeled documents from the agent's knowledge memory.
+// Fails if KnowledgeMemory is not configured in the AgentConfig.
+func (agent *Agent) DeleteKnowledge(ctx context.Context, label string) error {
+	if agent.cfg == nil {
+		return ErrAgentNotInitialized
+	} else if agent.cfg.KnowledgeMemory == nil {
+		return ErrKnowledgeMemoryNotConfigured
+	}
+	return agent.cfg.KnowledgeMemory.DeleteKnowledge(ctx, agent.cfg.ID, label)
 }

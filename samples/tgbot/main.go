@@ -18,6 +18,8 @@ import (
 	"github.com/gonzxlezs/agens/triggers/tgbot"
 	_ "github.com/lib/pq"
 	"google.golang.org/genai"
+
+	_ "github.com/joho/godotenv/autoload"
 )
 
 func main() {
@@ -79,24 +81,22 @@ func main() {
 		panic(err)
 	}
 
-	pgm, err := pgmemory.NewHistoryProvider(db)
+	historyMemory, err := pgmemory.NewHistoryMemory("history", db)
 	if err != nil {
 		panic(err)
 	}
 
 	// Agent
 	e21, err := agens.NewAgent(g, agens.AgentConfig{
+		ID:          "agent01",
 		Name:        "e21",
 		Description: "a general-purpose virtual assistant",
 		Instructions: []string{
 			"You receive messages from users via a Telegram bot and must respond to their messages.",
 		},
-		Model: model,
-		Batcher: &timedbatcher.TimedBatcher{
-			Duration: 5 * time.Second,
-		},
-		HistoryProvider:            pgm,
-		MaxMessagesPerConversation: 20,
+		Model:             model,
+		HistoryMemory:     historyMemory,
+		HistoryMemorySize: 20,
 	})
 
 	if err != nil {
@@ -105,6 +105,7 @@ func main() {
 
 	// Telegram bot trigger
 	tgTrigger, err := tgbot.NewWebhookTrigger(
+		"tgbot01",
 		TGBOT_TOKEN,
 		&tgbot.WebhookTriggerOpts{
 			SecretToken: TGBOT_WEBHOOK_SECRET,
@@ -119,6 +120,12 @@ func main() {
 		panic(err)
 	}
 
+	batcher := &timedbatcher.TimedBatcher{Duration: 5 * time.Second}
+	if err := tgTrigger.WithBatcher(batcher); err != nil {
+		panic(err)
+	}
+
+	// server
 	mux := http.NewServeMux()
 	for _, route := range tgTrigger.GetRoutes() {
 		pattern := fmt.Sprintf("%s %s", route.Method, route.Path)
@@ -139,7 +146,7 @@ func main() {
 		}
 	}(server)
 
-	err = tgTrigger.SetWebhook(TGBOT_WEBHOOK_DOMAIN)
+	err = tgbot.SetWebhook(tgTrigger, TGBOT_WEBHOOK_DOMAIN)
 	if err != nil {
 		panic(err)
 	}

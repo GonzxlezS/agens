@@ -1,23 +1,33 @@
 package agens
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/firebase/genkit/go/ai"
+	"github.com/firebase/genkit/go/genkit"
 )
 
 // DefaultSystemMessageFormat is the default template used to format the
 // system message passed to the AI model.
 const DefaultSystemMessageFormat = `You are %s, %s. 
 instructions:
+%s
+---
 %s`
 
-// AgentConfig contains the necessary configuration to define its behavior, including
-// the AI model to use, the available tools, and the logic for managing
-// conversation history memory.
+// ErrNoValidMessages is returned when the message sequence fails validation or is empty.
+var ErrNoValidMessages = errors.New("no valid messages in sequence")
+
+// AgentConfig holds the execution parameters, memory providers, and behavior
+// definitions for an Agent.
 type AgentConfig struct {
-	// Name is the name of the agent, used to identify its flow in Genkit.
+	// ID is the unique internal identifier for the agent used in Genkit flow tracing.
+	ID string
+
+	// Name is a user-friendly name of the agent.
 	Name string
 
 	// Description is a brief description of the agent's purpose.
@@ -30,81 +40,152 @@ type AgentConfig struct {
 	// If specified, it takes precedence over ModelName.
 	Model ai.ModelArg
 
-	// ModelName is the name of the AI model that the agent will use to generate responses.
-	// It is used only if Model is not defined (nil).
-	ModelName string
-
 	// Tools is a list of tools that the agent can use.
 	Tools []ai.ToolRef
 
-	// AdditionalOptions are extra options passed to the genkit.Generate function.
-	AdditionalOptions []ai.GenerateOption
+	// GenerateOptions are extra options passed to the genkit.Generate function.
+	GenerateOptions []ai.GenerateOption
 
-	// Batcher is responsible for batching incoming messages.
-	Batcher MessageBatcher
+	// HistoryMemory is responsible for persisting the conversation history.
+	HistoryMemory HistoryMemory
 
-	// HistoryProvider is responsible for persisting the conversation history.
-	HistoryProvider HistoryProvider
+	// HistoryMemorySize limits the number of messages kept in the context window.
+	HistoryMemorySize int
 
-	// MaxMessagesPerConversation defines the limit of messages to keep in context.
-	MaxMessagesPerConversation int
+	// KnowledgeMemory enables RAG (Retrieval-Augmented Generation) capabilities.
+	KnowledgeMemory KnowledgeMemory
 
-	// KnowledgeProvider is responsible for managing and retrieving domain-specific
-	// information to augment the agent's responses.
-	KnowledgeProvider KnowledgeProvider
-
-	// KnowledgeRetrieveLimit defines the maximum number of relevant documents
-	// to retrieve from the knowledge base per query.
+	// KnowledgeRetrieveLimit sets the maximum number of documents fetched per query.
 	KnowledgeRetrieveLimit int
 
-	// SystemPromptFunc is an optional function for formatting the system message.
-	// The system message is crucial for providing high-level instructions to the AI model.
-	SystemPromptFunc func(*AgentConfig) string
+	// SystemPromptFn allows for a custom implementation of the system instruction builder.
+	SystemPromptFn func(ctx context.Context, cfg *AgentConfig, in *Input) (string, error)
 
-	// ConversationIDFunc is an optional function for formatting the conversation id.
-	ConversationIDFunc func(msg *ai.Message) (string, error)
+	// SortMessagesFn provides a hook to filter or reorder messages before LLM inference.
+	SortMessagesFn func(msgs []*ai.Message) ([]*ai.Message, error)
 }
 
-// GetConversationID retrieves the conversation identifier for a given message.
-// It uses the custom ConversationIDFunc if provided; otherwise, it falls back
-// to DefaultConversationIDFunc.
-func (cfg *AgentConfig) GetConversationID(msg *ai.Message) (string, error) {
-	if cfg.ConversationIDFunc != nil {
-		return cfg.ConversationIDFunc(msg)
+// GenerateSystemPrompt determines and executes the strategy for building
+// the agent's system instructions.
+func (cfg *AgentConfig) GenerateSystemPrompt(ctx context.Context, input *Input) (string, error) {
+	if cfg.SystemPromptFn != nil {
+		return cfg.SystemPromptFn(ctx, cfg, input)
 	}
-	return DefaultConversationIDFunc(msg)
+	return DefaultSystemPromptFn(ctx, cfg, input)
 }
 
-// SystemMessage generates the system message for the agent.
-// This function checks if a custom function is provided in the AgentConfig struct.
-// If not, it uses the DefaultSystemPromptFunc function to generate the message.
-func (cfg *AgentConfig) SystemMessage() string {
-	if cfg.SystemPromptFunc != nil {
-		return cfg.SystemPromptFunc(cfg)
+func (cfg *AgentConfig) flowFn(g *genkit.Genkit) func(ctx context.Context, input *Input) (*ai.ModelResponse, error) {
+	var baseOpts = cfg.getGenerateOptions()
+
+	return func(ctx context.Context, input *Input) (*ai.ModelResponse, error) {
+		// system prompt
+		systemPrompt, err := cfg.GenerateSystemPrompt(ctx, input)
+		if err != nil {
+			return &ai.ModelResponse{}, err
+		}
+
+		// history
+		history, err := cfg.retrieveHistory(ctx, input.SessionID())
+		if err != nil {
+			return &ai.ModelResponse{}, err
+		}
+
+		// messages
+		messages, err := cfg.sortMessages(ctx, append(history, input.Messages...))
+		if err != nil {
+			return &ai.ModelResponse{}, err
+		}
+
+		// generate options
+		generateOpts := append(baseOpts,
+			ai.WithSystem(systemPrompt),
+			ai.WithMessages(messages...),
+		)
+
+		generateOpts = append(generateOpts, input.getOutputOption()...)
+
+		// generate
+		resp, err := genkit.Generate(ctx, g, generateOpts...)
+
+		// store history
+		if err == nil {
+			err = cfg.storeHistory(ctx, input.SessionID(), resp.History())
+		}
+
+		// response
+		return resp, err
 	}
-	return DefaultSystemPromptFunc(cfg)
 }
 
-// DefaultConversationIDFunc provides a standard way to generate a conversation ID
-// by concatenating the message source and channel ID (format: "source:channel_id").
-func DefaultConversationIDFunc(msg *ai.Message) (string, error) {
-	source, err := GetSource(msg)
-	if err != nil {
-		return "", err
+func (cfg *AgentConfig) getGenerateOptions() []ai.GenerateOption {
+	opts := append([]ai.GenerateOption(nil), cfg.GenerateOptions...)
+
+	// Model
+	if cfg.Model != nil {
+		opts = append(opts,
+			ai.WithModel(cfg.Model),
+		)
 	}
 
-	channel, err := GetChannelID(msg)
-	if err != nil {
-		return "", err
+	// Tools
+	tools := append([]ai.ToolRef(nil), cfg.Tools...)
+
+	if cfg.KnowledgeMemory != nil {
+		tools = append(tools,
+			cfg.KnowledgeMemory.AsTool(cfg.ID, cfg.KnowledgeRetrieveLimit),
+		)
 	}
 
-	return fmt.Sprintf("%s:%s", source, channel), nil
+	if len(tools) > 0 {
+		opts = append(opts,
+			ai.WithTools(tools...),
+		)
+	}
+
+	return opts
 }
 
-// DefaultSystemPromptFunc creates a formatted system message using the
-// DefaultSystemMessageFormat constant, injecting the agent's name, description,
-// and joining the instructions into a bulleted list.
-func DefaultSystemPromptFunc(cfg *AgentConfig) string {
+func (cfg *AgentConfig) sortMessages(ctx context.Context, msgs []*ai.Message) ([]*ai.Message, error) {
+	return genkit.Run(ctx, "sortMessages", func() ([]*ai.Message, error) {
+		if cfg.SortMessagesFn != nil {
+			return cfg.SortMessagesFn(msgs)
+		}
+		return DefaultSortMessagesFn(msgs)
+	})
+}
+
+func (cfg *AgentConfig) retrieveHistory(ctx context.Context, sessionID string) ([]*ai.Message, error) {
+	if cfg.HistoryMemory == nil {
+		return []*ai.Message{}, nil
+	}
+
+	return genkit.Run(ctx, "history", func() ([]*ai.Message, error) {
+		return cfg.HistoryMemory.RetrieveHistory(ctx, cfg.ID, sessionID)
+	})
+}
+
+func (cfg *AgentConfig) storeHistory(ctx context.Context, sessionID string, messages []*ai.Message) error {
+	if cfg.HistoryMemory == nil {
+		return nil
+	}
+
+	_, err := genkit.Run(ctx, "storeHistory", func() (bool, error) {
+		err := cfg.HistoryMemory.StoreHistory(ctx,
+			cfg.ID,
+			sessionID,
+			messages,
+			cfg.HistoryMemorySize,
+		)
+
+		return (err == nil), err
+	})
+
+	return err
+}
+
+// DefaultSystemPromptFn constructs a standardized system prompt by aggregating
+// agent metadata, core instructions, and dynamic runtime prompts.
+func DefaultSystemPromptFn(ctx context.Context, cfg *AgentConfig, input *Input) (string, error) {
 	var b strings.Builder
 	for _, Instruction := range cfg.Instructions {
 		fmt.Fprintf(&b, "- %s\n", Instruction)
@@ -114,5 +195,50 @@ func DefaultSystemPromptFunc(cfg *AgentConfig) string {
 		cfg.Name,
 		cfg.Description,
 		b.String(),
+		input.AdditionalSystemPrompt,
+	), nil
+}
+
+// DefaultSortMessagesFn filters and validates the message sequence to ensure
+// it follows a valid role-based order (User -> Model -> Tool).
+func DefaultSortMessagesFn(msgs []*ai.Message) ([]*ai.Message, error) {
+	if msgs == nil {
+		return nil, nil
+	}
+
+	var (
+		result       = make([]*ai.Message, 0, len(msgs))
+		previousRole ai.Role
 	)
+
+	for _, msg := range msgs {
+		switch {
+		case msg.Role == ai.RoleSystem:
+			// discard message
+			continue // keep last msg role
+
+		case (msg.Role == ai.RoleUser) && (previousRole == ""):
+			result = append(result, msg)
+
+		case (msg.Role == ai.RoleUser) && (previousRole == ai.RoleUser || previousRole == ai.RoleModel):
+			result = append(result, msg)
+
+		case (msg.Role == ai.RoleModel) && (previousRole == ai.RoleUser || previousRole == ai.RoleTool):
+			result = append(result, msg)
+
+		case (msg.Role == ai.RoleTool) && (previousRole == ai.RoleModel):
+			result = append(result, msg)
+
+		default:
+			// discard message
+			continue // keep last msg role
+		}
+
+		previousRole = msg.Role
+	}
+
+	if len(result) == 0 {
+		return nil, ErrNoValidMessages
+	}
+	return result, nil
 }
