@@ -19,6 +19,8 @@ import (
 	_ "github.com/lib/pq"
 	wapi "github.com/wapikit/wapi.go/pkg/client"
 	"google.golang.org/genai"
+
+	_ "github.com/joho/godotenv/autoload"
 )
 
 func main() {
@@ -64,8 +66,8 @@ func main() {
 		),
 	)
 
-	model := googlegenai.GoogleAIModelRef(
-		"gemini-2.5-flash",
+	model := googlegenai.ModelRef(
+		"googleai/gemini-2.5-flash",
 		&genai.GenerateContentConfig{
 			MaxOutputTokens: 500,
 			Temperature:     genai.Ptr[float32](0.5),
@@ -87,6 +89,7 @@ func main() {
 
 	// Agent
 	e21, err := agens.NewAgent(g, agens.AgentConfig{
+		ID:          "agentWA01",
 		Name:        "e21",
 		Description: "a general-purpose virtual assistant",
 		Instructions: []string{

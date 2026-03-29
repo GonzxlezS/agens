@@ -11,6 +11,14 @@ import (
 	"github.com/gonzxlezs/agens"
 )
 
+const OutputExampleTextMessage = `Output Example:
+{
+  "messages": [
+    { "text": "Hi!" },
+    { "text": "How can I help you today?" }
+  ]
+}`
+
 const MaxLengthMessageText = 4096
 
 type MessageResponse struct {
@@ -70,9 +78,10 @@ func (trigger *Trigger) TextHandler(_ *gotgbot.Bot, tgCtx *ext.Context) error {
 
 	// input
 	input := &agens.Input{
-		Trigger:  trigger.TriggerID,
-		Source:   source,
-		Messages: batch,
+		Trigger:                trigger.TriggerID,
+		Source:                 source,
+		Messages:               batch,
+		AdditionalSystemPrompt: OutputExampleTextMessage,
 	}
 
 	input = input.WithOutputType(MessageResponses{})

@@ -2,6 +2,7 @@ package agens
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/firebase/genkit/go/ai"
 	"github.com/firebase/genkit/go/core"
@@ -23,6 +24,9 @@ type Input struct {
 // SessionID generates a composite key based on Trigger and Source.
 // Returns an empty string if both fields are missing.
 func (in *Input) SessionID() string {
+	in.Trigger = strings.TrimSpace(in.Trigger)
+	in.Source = strings.TrimSpace(in.Source)
+
 	if (in.Trigger == "") && (in.Source == "") {
 		return ""
 	}
@@ -39,7 +43,7 @@ func (in *Input) WithOutputType(output any) *Input {
 	return in
 }
 
-func (in *Input) getOutputOption() []ai.GenerateOption {
+func (in *Input) outputOptions() []ai.GenerateOption {
 	var outputOpts []ai.GenerateOption
 
 	if in.OutputSchema != nil {

@@ -16,18 +16,27 @@ type WebhookTriggerOpts struct {
 	BotOpts        *gotgbot.BotOpts
 	DispatcherOpts *ext.DispatcherOpts
 	UpdaterOpts    *ext.UpdaterOpts
-
-	SubPath        string
-	SecretToken    string
 	SetWebhookOpts *gotgbot.SetWebhookOpts
+
+	// SubPath is the base routing path for the webhook.
+	SubPath string
+
+	// SecretPath is a unique identifier or token appended to the URL
+	// to prevent unauthorized update injections. Defaults to the bot token.
+	SecretPath string
+
+	// SecretToken is a random string used to verify that the webhook
+	// request comes from the official source.
+	SecretToken string
 }
 
 type WebhookTrigger struct {
 	*Trigger
-
-	SubPath        string
-	SecretToken    string
 	SetWebhookOpts *gotgbot.SetWebhookOpts
+
+	SubPath     string
+	SecretPath  string
+	SecretToken string
 }
 
 func NewWebhookTrigger(triggerID string, token string, opts *WebhookTriggerOpts) (*WebhookTrigger, error) {
@@ -55,6 +64,11 @@ func NewWebhookTrigger(triggerID string, token string, opts *WebhookTriggerOpts)
 		trigger.SubPath = opts.SubPath
 	}
 
+	trigger.SecretPath = token
+	if opts.SecretPath != "" {
+		trigger.SecretPath = opts.SecretPath
+	}
+
 	trigger.SecretToken = opts.SecretToken
 
 	trigger.SetWebhookOpts = opts.SetWebhookOpts
@@ -74,7 +88,7 @@ func (trigger *WebhookTrigger) RegisterAgent(agent *agens.Agent) error {
 
 	return trigger.Updater.AddWebhook(
 		trigger.Bot,
-		trigger.Bot.Token,
+		trigger.SecretPath,
 		&ext.AddWebhookOpts{
 			SecretToken: trigger.SecretToken,
 		},

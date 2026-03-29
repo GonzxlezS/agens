@@ -20,8 +20,7 @@ type TriggerOpts struct {
 	BotOpts        *gotgbot.BotOpts
 	DispatcherOpts *ext.DispatcherOpts
 	UpdaterOpts    *ext.UpdaterOpts
-
-	PollingOpts *ext.PollingOpts
+	PollingOpts    *ext.PollingOpts
 }
 
 type Trigger struct {
@@ -61,7 +60,7 @@ func NewTrigger(triggerID string, token string, opts *TriggerOpts) (*Trigger, er
 	}
 
 	trigger.Dispatcher = ext.NewDispatcher(opts.DispatcherOpts)
-	trigger.Dispatcher.AddHandler(handlers.NewMessage(message.Text, trigger.TextHandler))
+	trigger.AddHandler(handlers.NewMessage(message.Text, trigger.TextHandler))
 
 	trigger.Updater = ext.NewUpdater(trigger.Dispatcher, opts.UpdaterOpts)
 
@@ -86,4 +85,8 @@ func (trigger *Trigger) RegisterAgent(agent *agens.Agent) error {
 func (trigger *Trigger) WithBatcher(batcher agens.MessageBatcher) error {
 	trigger.Batcher = batcher
 	return nil
+}
+
+func (trigger *Trigger) AddHandler(handler ext.Handler) {
+	trigger.Dispatcher.AddHandler(handler)
 }

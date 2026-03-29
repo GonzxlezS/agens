@@ -9,6 +9,10 @@ import (
 	"github.com/firebase/genkit/go/genkit"
 )
 
+const ToolNameFormat = "%s_%s_tool"
+
+var ErrKnowledgeMemoryFailure = fmt.Errorf("pgmemory: knowledge memory failure")
+
 type (
 	KnowledgeQuery struct {
 		Query string `json:"query" jsonschema_description:"The specific search query or keywords to retrieve relevant information from the knowledge base. Should be clear and focused on the topic."`
@@ -25,21 +29,11 @@ type (
 	}
 )
 
-var ErrKnowledgeMemoryFailure = fmt.Errorf("pgmemory: knowledge memory failure")
-
-func defineTool(g *genkit.Genkit, retriever ai.Retriever, cfg *KnowledgeMemoryConfig, agentID string, limit int) ai.Tool {
-	toolName := fmt.Sprintf("%s_%s_tool", agentID, cfg.Name)
+func (m *KnowledgeMemory) AsTool(agentID string, limit int) ai.Tool {
+	toolName := fmt.Sprintf(ToolNameFormat, agentID, m.cfg.Name)
 
 	f := func(ctx *ai.ToolContext, query KnowledgeQuery) (KnowledgeResponse, error) {
-		resp, err := genkit.Retrieve(
-			ctx, g,
-			ai.WithRetriever(retriever),
-			ai.WithConfig(&RetrieveOptions{
-				AgentID: agentID,
-				Limit:   limit,
-			}),
-			ai.WithTextDocs(query.Query),
-		)
+		resp, err := m.RetrieveKnowledge(ctx, agentID, query.Query, limit)
 		if err != nil {
 			return KnowledgeResponse{}, errors.Join(ErrKnowledgeMemoryFailure, err)
 		}
@@ -53,7 +47,7 @@ func defineTool(g *genkit.Genkit, retriever ai.Retriever, cfg *KnowledgeMemoryCo
 		}
 
 		for _, doc := range resp.Documents {
-			label, _ := doc.Metadata[labelKey].(string)
+			label, _ := doc.Metadata[LabelKey].(string)
 			if label == "" {
 				label = "unlabeled"
 			}
@@ -70,7 +64,7 @@ func defineTool(g *genkit.Genkit, retriever ai.Retriever, cfg *KnowledgeMemoryCo
 		return kResponse, nil
 	}
 
-	return genkit.DefineTool(g, toolName, cfg.Description, f)
+	return genkit.DefineTool(m.g, toolName, m.cfg.Description, f)
 }
 
 func documentToText(doc *ai.Document) string {

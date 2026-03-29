@@ -301,8 +301,8 @@ func TestInput(t *testing.T) {
 			tt.Fatalf("session id must be empty, SessionID(%s)", emptyIn.SessionID())
 		}
 
-		// empty getOutputOption
-		if len(emptyIn.getOutputOption()) != 0 {
+		// empty outputOptions
+		if len(emptyIn.outputOptions()) != 0 {
 			tt.Fatal("output options must be empty")
 		}
 
@@ -313,7 +313,7 @@ func TestInput(t *testing.T) {
 
 		emptyIn.WithOutputInstructions("")
 
-		if len(emptyIn.getOutputOption()) != 1 {
+		if len(emptyIn.outputOptions()) != 1 {
 			tt.Fatal("output options cannot be empty")
 		}
 
@@ -337,8 +337,8 @@ func TestInput(t *testing.T) {
 		t.Fatalf("session id must be test_21, SessionID(%s)", in.SessionID())
 	}
 
-	// empty getOutputOption
-	if len(in.getOutputOption()) != 0 {
+	// empty outputOptions
+	if len(in.outputOptions()) != 0 {
 		t.Fatal("output options must be empty")
 	}
 
@@ -349,7 +349,7 @@ func TestInput(t *testing.T) {
 
 	in.WithOutputInstructions("test")
 
-	if len(in.getOutputOption()) != 1 {
+	if len(in.outputOptions()) != 1 {
 		t.Fatal("output options cannot be empty")
 	}
 
@@ -369,7 +369,7 @@ func TestInput(t *testing.T) {
 	outputT := struct{ Name string }{Name: "test"}
 	in.WithOutputType(outputT)
 
-	if len(in.getOutputOption()) != 2 {
+	if len(in.outputOptions()) != 2 {
 		t.Fatal("len output options must be 2")
 	}
 
@@ -386,20 +386,20 @@ func TestConfig(t *testing.T) {
 			},
 		}
 
-		if len(cfg.getGenerateOptions()) == 0 {
+		if len(cfg.generateOptions()) == 0 {
 			t.Fatal("cannot be empty")
 		}
 
 		// model
 		cfg.Model = ai.NewModelRef("test", nil)
-		if len(cfg.getGenerateOptions()) != 2 {
+		if len(cfg.generateOptions()) != 2 {
 			t.Fatal("invalid opts")
 		}
 
 		// knowledge
 		cfg.KnowledgeMemory = &testMemory{}
 
-		if len(cfg.getGenerateOptions()) != 3 {
+		if len(cfg.generateOptions()) != 3 {
 			t.Fatal("invalid opts")
 		}
 	})
@@ -498,8 +498,6 @@ func TestSortMessagesFn(t *testing.T) {
 		var (
 			ctx = context.Background()
 
-			g = genkit.Init(ctx)
-
 			cfg = AgentConfig{
 				ID:          "021",
 				Name:        "e21",
@@ -513,7 +511,7 @@ func TestSortMessagesFn(t *testing.T) {
 				return cfg.sortMessages(ctx, msgs)
 			}
 
-			flow = genkit.DefineFlow(g, "testSortMessagesFn", fn)
+			flow = genkit.NewFlow("testSortMessagesFn", fn)
 
 			inMessages = []*ai.Message{
 				userMsg,
@@ -616,8 +614,6 @@ func TestHistoryMemory(t *testing.T) {
 	var (
 		ctx = context.Background()
 
-		g = genkit.Init(ctx)
-
 		cfg = AgentConfig{
 			ID:          "021",
 			Name:        "e21",
@@ -647,8 +643,8 @@ func TestHistoryMemory(t *testing.T) {
 			return struct{}{}, cfg.storeHistory(ctx, in.sessionID, in.messages)
 		}
 
-		retrieveFlow = genkit.DefineFlow(g, "testHistoryMemoryRetrieve", retrieveFn)
-		storeFlow    = genkit.DefineFlow(g, "testHistoryMemoryStore", storeFn)
+		retrieveFlow = genkit.NewFlow("testHistoryMemoryRetrieve", retrieveFn)
+		storeFlow    = genkit.NewFlow("testHistoryMemoryStore", storeFn)
 	)
 
 	t.Run("emptyRetrieve", func(t *testing.T) {

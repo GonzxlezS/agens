@@ -23,10 +23,16 @@ var ErrEmptyTriggerID = errors.New("trigger id cannot be empty")
 type WebhookTrigger struct {
 	TriggerID string
 
-	Client  *wapi.Client
-	Echo    *echo.Echo
-	Logger  *slog.Logger
+	Client *wapi.Client
+	Echo   *echo.Echo
+	Logger *slog.Logger
+
+	// SubPath is the base routing path for the webhook.
 	SubPath string
+
+	// SecretPath is a unique identifier or token appended to the URL
+	// to prevent unauthorized update injections. Defaults to the business id.
+	SecretPath string
 
 	Agent   *agens.Agent
 	Batcher agens.MessageBatcher
@@ -39,14 +45,18 @@ func NewWebhookTrigger(triggerID string, config *wapi.ClientConfig) (*WebhookTri
 	}
 
 	trigger := &WebhookTrigger{
-		TriggerID: triggerID,
-		Client:    wapi.New(config),
-		Echo:      echo.New(),
-		Logger:    slog.New(slog.NewTextHandler(os.Stdout, nil)),
-		SubPath:   DefaultSubPath,
+		TriggerID:  triggerID,
+		Client:     wapi.New(config),
+		Echo:       echo.New(),
+		Logger:     slog.New(slog.NewTextHandler(os.Stdout, nil)),
+		SubPath:    DefaultSubPath,
+		SecretPath: config.BusinessAccountId,
 	}
 
-	trigger.Client.On(events.TextMessageEventType, trigger.TextHandler)
+	trigger.AddHandler(&Handler{
+		EventType: events.TextMessageEventType,
+		HandlerFn: trigger.TextHandler,
+	})
 
 	return trigger, nil
 }
@@ -71,7 +81,7 @@ func (trigger *WebhookTrigger) WithBatcher(batcher agens.MessageBatcher) error {
 
 func (trigger *WebhookTrigger) GetRoutes() []agens.WebhookTriggerRoute {
 	var (
-		path        = trigger.SubPath + trigger.Client.Business.BusinessAccountId
+		path        = trigger.SubPath + trigger.SecretPath
 		getHandler  = trigger.Client.GetWebhookGetRequestHandler()
 		postHandler = trigger.Client.GetWebhookPostRequestHandler()
 	)
@@ -88,6 +98,10 @@ func (trigger *WebhookTrigger) GetRoutes() []agens.WebhookTriggerRoute {
 			Handler: wrapHandler(trigger.Echo, postHandler),
 		},
 	}
+}
+
+func (trigger *WebhookTrigger) AddHandler(handler *Handler) {
+	trigger.Client.On(handler.EventType, handler.HandlerFn)
 }
 
 func wrapHandler(e *echo.Echo, handler echo.HandlerFunc) http.HandlerFunc {

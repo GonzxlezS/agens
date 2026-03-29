@@ -12,7 +12,7 @@ import (
 
 // DefaultSystemMessageFormat is the default template used to format the
 // system message passed to the AI model.
-const DefaultSystemMessageFormat = `You are %s, %s. 
+const DefaultSystemMessageFormat = `You are %s, %s.
 instructions:
 %s
 ---
@@ -75,7 +75,7 @@ func (cfg *AgentConfig) GenerateSystemPrompt(ctx context.Context, input *Input) 
 }
 
 func (cfg *AgentConfig) flowFn(g *genkit.Genkit) func(ctx context.Context, input *Input) (*ai.ModelResponse, error) {
-	var baseOpts = cfg.getGenerateOptions()
+	var baseOpts = cfg.generateOptions()
 
 	return func(ctx context.Context, input *Input) (*ai.ModelResponse, error) {
 		// system prompt
@@ -102,7 +102,7 @@ func (cfg *AgentConfig) flowFn(g *genkit.Genkit) func(ctx context.Context, input
 			ai.WithMessages(messages...),
 		)
 
-		generateOpts = append(generateOpts, input.getOutputOption()...)
+		generateOpts = append(generateOpts, input.outputOptions()...)
 
 		// generate
 		resp, err := genkit.Generate(ctx, g, generateOpts...)
@@ -117,7 +117,7 @@ func (cfg *AgentConfig) flowFn(g *genkit.Genkit) func(ctx context.Context, input
 	}
 }
 
-func (cfg *AgentConfig) getGenerateOptions() []ai.GenerateOption {
+func (cfg *AgentConfig) generateOptions() []ai.GenerateOption {
 	opts := append([]ai.GenerateOption(nil), cfg.GenerateOptions...)
 
 	// Model
@@ -213,11 +213,7 @@ func DefaultSortMessagesFn(msgs []*ai.Message) ([]*ai.Message, error) {
 
 	for _, msg := range msgs {
 		switch {
-		case msg.Role == ai.RoleSystem:
-			// discard message
-			continue // keep last msg role
-
-		case (msg.Role == ai.RoleUser) && (previousRole == ""):
+		case (previousRole == "") && (msg.Role == ai.RoleUser):
 			result = append(result, msg)
 
 		case (msg.Role == ai.RoleUser) && (previousRole == ai.RoleUser || previousRole == ai.RoleModel):

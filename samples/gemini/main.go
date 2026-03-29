@@ -50,8 +50,8 @@ func main() {
 		),
 	)
 
-	model := googlegenai.GoogleAIModelRef(
-		"gemini-2.5-flash",
+	model := googlegenai.ModelRef(
+		"googleai/gemini-2.5-flash",
 		&genai.GenerateContentConfig{
 			MaxOutputTokens: 500,
 			Temperature:     genai.Ptr[float32](0.5),

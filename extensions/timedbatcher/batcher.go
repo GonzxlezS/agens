@@ -19,11 +19,17 @@ var (
 	ErrNilMessage = errors.New("message cannot be nil")
 )
 
+type batchState struct {
+	messages []*ai.Message
+	timer    *time.Timer
+	out      chan []*ai.Message
+}
+
 type TimedBatcher struct {
 	Duration time.Duration
 
-	mu       sync.Mutex
-	channels map[string]chan *ai.Message
+	mu      sync.Mutex
+	batches map[string]*batchState
 }
 
 func (b *TimedBatcher) Add(_ context.Context, batchID string, msg *ai.Message) ([]*ai.Message, error) {
@@ -34,61 +40,39 @@ func (b *TimedBatcher) Add(_ context.Context, batchID string, msg *ai.Message) (
 	}
 
 	b.mu.Lock()
-	if b.channels == nil {
-		b.channels = make(map[string]chan *ai.Message)
+	if b.batches == nil {
+		b.batches = make(map[string]*batchState)
 	}
 
-	var out chan []*ai.Message
+	state, exists := b.batches[batchID]
+	if !exists {
+		state = &batchState{
+			messages: make([]*ai.Message, 0),
+			out:      make(chan []*ai.Message, 1),
+		}
+		b.batches[batchID] = state
 
-	ch, ok := b.channels[batchID]
-	if !ok {
-		ch = make(chan *ai.Message, 100)
-		b.channels[batchID] = ch
+		state.timer = time.AfterFunc(b.Duration, func() {
+			b.mu.Lock()
+			defer b.mu.Unlock()
 
-		out = make(chan []*ai.Message)
-		go b.start(batchID, ch, out)
+			currentState, ok := b.batches[batchID]
+			if ok && currentState == state {
+				delete(b.batches, batchID)
+
+				state.out <- state.messages
+				close(state.out)
+			}
+		})
+	} else {
+		state.timer.Reset(b.Duration)
 	}
 
-	ch <- msg
+	state.messages = append(state.messages, msg)
 	b.mu.Unlock()
 
-	if ok {
+	if exists {
 		return nil, nil
 	}
-	return <-out, nil
-}
-
-func (b *TimedBatcher) start(batchID string, ch chan *ai.Message, out chan []*ai.Message) {
-	var (
-		batch []*ai.Message
-		timer = time.NewTimer(b.Duration)
-	)
-
-	defer func() {
-		b.mu.Lock()
-		delete(b.channels, batchID)
-		close(ch)
-		b.mu.Unlock()
-
-		out <- batch
-	}()
-
-	for {
-		select {
-		case msg, ok := <-ch:
-			if !ok {
-				return
-			}
-
-			batch = append(batch, msg)
-
-			if !timer.Stop() {
-				<-timer.C
-			}
-			timer.Reset(b.Duration)
-
-		case <-timer.C:
-			return
-		}
-	}
+	return <-state.out, nil
 }

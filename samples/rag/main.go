@@ -64,8 +64,8 @@ func main() {
 		),
 	)
 
-	model := googlegenai.GoogleAIModelRef(
-		"gemini-2.5-flash",
+	model := googlegenai.ModelRef(
+		"googleai/gemini-2.5-flash",
 		&genai.GenerateContentConfig{
 			MaxOutputTokens: 500,
 			Temperature:     genai.Ptr[float32](0.5),
@@ -73,6 +73,25 @@ func main() {
 			TopK:            genai.Ptr[float32](50),
 		},
 	)
+
+	// model := ollamaPlugin.DefineModel(
+	// 	g,
+	// 	ollama.ModelDefinition{
+	// 		Name: "smollm2",
+	// 		Type: "chat", // "chat" or "generate"
+	// 	},
+	// 	&ai.ModelOptions{
+	// 		Supports: &ai.ModelSupports{
+	// 			Constrained: ai.ConstrainedSupportAll,
+	// 			Context:     true,
+	// 			Multiturn:   true,
+	// 			SystemRole:  true,
+	// 			Tools:       true,
+	// 			ToolChoice:  true,
+	// 			Media:       false,
+	// 		},
+	// 	},
+	// )
 
 	embedder := ollamaPlugin.DefineEmbedder(g, OLLAMA_HOST, "embeddinggemma", nil)
 
@@ -181,33 +200,33 @@ func main() {
 }
 
 const agensErrorsP1 = `agens errors (v0.4.0):
-	ErrAgentNotInitialized: "agent not initialized, is returned if an attempt 
+	ErrAgentNotInitialized: "agent not initialized, is returned if an attempt
 	is made to run an agent that has not been properly initialized."
 
-	ErrKnowledgeMemoryNotConfigured: "knowledge memory is not configured for this agent, 
+	ErrKnowledgeMemoryNotConfigured: "knowledge memory is not configured for this agent,
 	is returned when an operation is attempted on an agent that does not have a KnowledgeMemory initialized."
 
-	ErrInvalidOutputOption: "output option in context is invalid is returned when 
-	a value associated with the output option key exists in the context, 
+	ErrInvalidOutputOption: "output option in context is invalid is returned when
+	a value associated with the output option key exists in the context,
 	but it is not of the expected type (ai.OutputOption)."
 `
 
 const agensErrorsP2 = `
 	ErrMetadataNotFound: "metadata not found, is returned if the message metadata map is nil."
 
-	ErrChannelIDNotInMetadata: "channel ID not found in metadata, is returned if the channel ID 
+	ErrChannelIDNotInMetadata: "channel ID not found in metadata, is returned if the channel ID
 	is not present in the message metadata."
 
-	ErrSourceNotInMetadata: "source not found in metadata, is returned if the source is not 
+	ErrSourceNotInMetadata: "source not found in metadata, is returned if the source is not
 	present in the message metadata."
 
-	ErrUserIDNotInMetadata: "user ID not found in metadata, is returned if the user ID is 
+	ErrUserIDNotInMetadata: "user ID not found in metadata, is returned if the user ID is
 	not present in the message metadata."
 `
 
 const agensErrorsP3 = `
 	ErrChannelIDNotAString: "channel ID is not a string type, is returned if the channel ID in metadata is not a string."
- 
+
 	ErrSourceNotAString: "source is not a string type, is returned if the source in metadata is not a string."
 
 	ErrStoredIDNotAString: "stored ID is not a string type, is returned if the stored ID in metadata is not a string."

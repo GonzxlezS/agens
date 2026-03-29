@@ -4,17 +4,13 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
-	"errors"
 	"fmt"
 
 	"github.com/firebase/genkit/go/ai"
-	"github.com/firebase/genkit/go/core/api"
 	"github.com/firebase/genkit/go/genkit"
 	"github.com/gonzxlezs/agens"
 	pgv "github.com/pgvector/pgvector-go"
 )
-
-const Provider = "pgmemory"
 
 const (
 	TableNameFormat = "knowledge_embeddings_%d"
@@ -45,11 +41,11 @@ const (
 	BEGIN
 		FOR mismatch IN
 			WITH expected_layout AS (
-				SELECT * FROM (VALUES 
+				SELECT * FROM (VALUES
 					('id', 'int4'),
 					('agent_id', 'text'),
 					('embedder_name', 'text'),
-					('label', 'text'),			
+					('label', 'text'),
 					('content', 'text'),
 					('content_hash', 'text'),
 					('embedding', 'vector'),
@@ -57,16 +53,16 @@ const (
 				) AS t(col_name, col_type)
 			),
 			current_layout AS (
-				SELECT column_name, udt_name 
-				FROM information_schema.columns 
+				SELECT column_name, udt_name
+				FROM information_schema.columns
 				WHERE table_name = '%s' AND table_schema = 'public'
 			)
-			SELECT 
+			SELECT
 				e.col_name,
-				CASE 
-					WHEN c.column_name IS NULL 
+				CASE
+					WHEN c.column_name IS NULL
 						THEN 'MISSING COLUMN'
-					WHEN e.col_type != c.udt_name 
+					WHEN e.col_type != c.udt_name
 						THEN 'INVALID TYPE (expected ' || e.col_type || ', found ' || c.udt_name || ')'
 					ELSE NULL
 				END as error_msg
@@ -83,69 +79,45 @@ const (
 	DeleteByLabelQueryFormat = `DELETE FROM %s WHERE agent_id = $1 AND embedder_name = $2 AND label = $3`
 
 	IndexKnowledgeQueryFormat = `INSERT INTO %s (
-		agent_id, 
+		agent_id,
 		embedder_name,
-		label, 
+		label,
 		content,
 		content_hash,
 		embedding
 	) VALUES ($1, $2, $3, $4, $5, $6)`
 
 	IsIndexedQueryFormat = `SELECT EXISTS(
-        SELECT 1 FROM %s 
-            WHERE agent_id = $1 
+        SELECT 1 FROM %s
+            WHERE agent_id = $1
             AND embedder_name = $2
             AND label = $3
             AND content_hash = $4
     )`
 
-	RetrieveKnowledgeQueryFormat = `SELECT label, content 
-    FROM %s 
-    WHERE agent_id = $1 AND embedder_name = $2
-    ORDER BY embedding <#> $3 LIMIT $4`
+	RetrieveKnowledgeQueryFormat = `SELECT label, content
+		FROM %s
+		WHERE agent_id = $1 AND embedder_name = $2
+		ORDER BY embedding <#> $3 LIMIT $4`
+
+	ReassignKnowledgeQueryFormat = `UPDATE %s
+		SET agent_id = $1
+		WHERE agent_id = $2 AND label = $3`
 )
-
-const labelKey = "label"
-
-var ErrInvalidRetrieveOptions = errors.New("pgmemory: invalid or missing retrieval options")
 
 var _ agens.KnowledgeMemory = &KnowledgeMemory{}
 
-type RetrieveOptions struct {
-	AgentID string
-	Limit   int
-}
-
-type KnowledgeMemoryConfig struct {
-	Name        string
-	Description string
-
-	Embedder   ai.Embedder
-	Dimensions int
-
-	RetrieverOptions *ai.RetrieverOptions
-	EmbedderOptions  []ai.EmbedderOption
-}
-
-func (cfg *KnowledgeMemoryConfig) getEmbedderOptions(additionalOptions ...ai.EmbedderOption) []ai.EmbedderOption {
-	embedderOpts := make([]ai.EmbedderOption, 0, len(cfg.EmbedderOptions)+len(additionalOptions)+1)
-
-	embedderOpts = append(embedderOpts, cfg.EmbedderOptions...)
-	embedderOpts = append(embedderOpts, additionalOptions...)
-
-	if cfg.Embedder != nil {
-		embedderOpts = append(embedderOpts, ai.WithEmbedder(cfg.Embedder))
-	}
-	return embedderOpts
-}
-
 type KnowledgeMemory struct {
-	g   *genkit.Genkit
-	db  *sql.DB
+	g         *genkit.Genkit
+	retriever ai.Retriever
+
 	cfg *KnowledgeMemoryConfig
 
-	tableName string
-	retriever ai.Retriever
+	db            *sql.DB
+	stmtDelete    *sql.Stmt
+	stmtIndex     *sql.Stmt
+	stmtIsIndexed *sql.Stmt
+	stmtReassign  *sql.Stmt
 }
 
 func NewKnowledgeMemory(g *genkit.Genkit, db *sql.DB, cfg KnowledgeMemoryConfig) (*KnowledgeMemory, error) {
@@ -155,6 +127,7 @@ func NewKnowledgeMemory(g *genkit.Genkit, db *sql.DB, cfg KnowledgeMemoryConfig)
 		return nil, err
 	}
 
+	// transaction
 	tx, err := db.BeginTx(context.Background(), nil)
 	if err != nil {
 		return nil, fmt.Errorf("error starting transaction: %w", err)
@@ -163,44 +136,72 @@ func NewKnowledgeMemory(g *genkit.Genkit, db *sql.DB, cfg KnowledgeMemoryConfig)
 
 	// table
 	query := fmt.Sprintf(CreateKnowledgeEmbeddingsQueryFormat, tableName, cfg.Dimensions)
-	if _, err := tx.ExecContext(context.Background(), query); err != nil {
+	if _, err := tx.Exec(query); err != nil {
 		return nil, fmt.Errorf("error creating table: %w", err)
 	}
 
 	// check
 	query = fmt.Sprintf(CheckKnowledgeSchemaQueryFormat, tableName)
-	if _, err := tx.ExecContext(context.Background(), query); err != nil {
+	if _, err := tx.Exec(query); err != nil {
 		return nil, err
 	}
 
 	// index
 	query = fmt.Sprintf(CreateKnowledgeLabelIndexQueryFormat, tableName, tableName)
-	if _, err := tx.ExecContext(context.Background(), query); err != nil {
+	if _, err := tx.Exec(query); err != nil {
 		return nil, fmt.Errorf("error creating index: %w", err)
 	}
 
 	query = fmt.Sprintf(CreateKnowledgeHashIndexQueryFormat, tableName, tableName)
-	if _, err := tx.ExecContext(context.Background(), query); err != nil {
+	if _, err := tx.Exec(query); err != nil {
 		return nil, fmt.Errorf("error creating index: %w", err)
 	}
 
 	query = fmt.Sprintf(CreateKnowledgeIvfflatIndexQueryFormat, tableName, tableName)
-	if _, err := tx.ExecContext(context.Background(), query); err != nil {
+	if _, err := tx.Exec(query); err != nil {
 		return nil, fmt.Errorf("error creating index: %w", err)
 	}
 
-	// KnowledgeMemory
-	return &KnowledgeMemory{
-		g:         g,
-		db:        db,
-		cfg:       &cfg,
-		tableName: tableName,
-		retriever: defineRetriever(g, db, tableName, &cfg),
-	}, tx.Commit()
-}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
 
-func (m *KnowledgeMemory) AsTool(agentID string, limit int) ai.Tool {
-	return defineTool(m.g, m.retriever, m.cfg, agentID, limit)
+	// statements
+	stmtDelete, err := db.Prepare(fmt.Sprintf(DeleteByLabelQueryFormat, tableName))
+	if err != nil {
+		return nil, err
+	}
+
+	stmtIndex, err := db.Prepare(fmt.Sprintf(IndexKnowledgeQueryFormat, tableName))
+	if err != nil {
+		return nil, err
+	}
+
+	stmtIsIndexed, err := db.Prepare(fmt.Sprintf(IsIndexedQueryFormat, tableName))
+	if err != nil {
+		return nil, err
+	}
+
+	stmtRetrieve, err := db.Prepare(fmt.Sprintf(RetrieveKnowledgeQueryFormat, tableName))
+	if err != nil {
+		return nil, err
+	}
+
+	stmtReassign, err := db.Prepare(fmt.Sprintf(ReassignKnowledgeQueryFormat, tableName))
+	if err != nil {
+		return nil, err
+	}
+
+	return &KnowledgeMemory{
+		g:             g,
+		db:            db,
+		cfg:           &cfg,
+		retriever:     defineRetriever(g, &cfg, stmtRetrieve),
+		stmtDelete:    stmtDelete,
+		stmtIndex:     stmtIndex,
+		stmtIsIndexed: stmtIsIndexed,
+		stmtReassign:  stmtReassign,
+	}, nil
 }
 
 func (m *KnowledgeMemory) DeleteKnowledge(ctx context.Context, agentID string, label string) error {
@@ -208,8 +209,7 @@ func (m *KnowledgeMemory) DeleteKnowledge(ctx context.Context, agentID string, l
 		return ErrDBNotInitialized
 	}
 
-	query := fmt.Sprintf(DeleteByLabelQueryFormat, m.tableName)
-	_, err := m.db.ExecContext(ctx, query, agentID, m.cfg.Embedder.Name(), label)
+	_, err := m.stmtDelete.ExecContext(ctx, agentID, m.cfg.Embedder.Name(), label)
 	if err != nil {
 		return fmt.Errorf("error deleting knowledge: %w", err)
 	}
@@ -252,7 +252,7 @@ func (m *KnowledgeMemory) IndexKnowledge(ctx context.Context, agentID string, la
 	res, err := genkit.Embed(
 		ctx,
 		m.g,
-		m.cfg.getEmbedderOptions(
+		m.cfg.embedderOptions(
 			ai.WithDocs(docsToEmbed...),
 		)...,
 	)
@@ -261,17 +261,14 @@ func (m *KnowledgeMemory) IndexKnowledge(ctx context.Context, agentID string, la
 		return err
 	}
 
-	var (
-		query        = fmt.Sprintf(IndexKnowledgeQueryFormat, m.tableName)
-		embedderName = m.cfg.Embedder.Name()
-	)
+	var embedderName = m.cfg.Embedder.Name()
 
 	for i, emb := range res.Embeddings {
 		content := documentToText(docsToEmbed[i])
 		currentHash := hashesToEmbed[i]
 		embedding := pgv.NewVector(emb.Embedding)
 
-		_, err := m.db.ExecContext(ctx, query, agentID, embedderName, label, content, currentHash, embedding)
+		_, err := m.stmtIndex.ExecContext(ctx, agentID, embedderName, label, content, currentHash, embedding)
 		if err != nil {
 			return err
 		}
@@ -285,77 +282,28 @@ func (m *KnowledgeMemory) isIndexed(ctx context.Context, agentID string, label s
 		return false, ErrDBNotInitialized
 	}
 
-	var (
-		query  = fmt.Sprintf(IsIndexedQueryFormat, m.tableName)
-		exists bool
-	)
-	err := m.db.QueryRowContext(ctx, query, agentID, m.cfg.Embedder.Name(), label, content_hash).Scan(&exists)
+	var exists bool
+	err := m.stmtIsIndexed.QueryRowContext(ctx, agentID, m.cfg.Embedder.Name(), label, content_hash).Scan(&exists)
 	if err != nil {
 		return false, fmt.Errorf("database error: %v", err)
 	}
 	return exists, nil
 }
 
+func (m *KnowledgeMemory) ReassignKnowledge(ctx context.Context, fromAgentID string, label string, toAgentID string) error {
+	if m.db == nil {
+		return ErrDBNotInitialized
+	}
+
+	_, err := m.stmtReassign.ExecContext(ctx, toAgentID, fromAgentID, label)
+	if err != nil {
+		return fmt.Errorf("failed to reassign knowledge: %w", err)
+	}
+	return nil
+}
+
 func calculateHash(content string) string {
 	h := sha256.New()
 	h.Write([]byte(content))
 	return fmt.Sprintf("%x", h.Sum(nil))
-}
-
-func defineRetriever(g *genkit.Genkit, db *sql.DB, tableName string, cfg *KnowledgeMemoryConfig) ai.Retriever {
-	f := func(ctx context.Context, req *ai.RetrieverRequest) (*ai.RetrieverResponse, error) {
-		opts, ok := req.Options.(*RetrieveOptions)
-		if !ok || opts == nil {
-			return nil, ErrInvalidRetrieveOptions
-		}
-
-		if opts.Limit <= 0 {
-			// Default limit if not specified or invalid
-			opts.Limit = 3
-		}
-
-		eres, err := genkit.Embed(
-			ctx,
-			g,
-			cfg.getEmbedderOptions(ai.WithDocs(req.Query))...,
-		)
-
-		if err != nil {
-			return nil, err
-		}
-
-		query := fmt.Sprintf(RetrieveKnowledgeQueryFormat, tableName)
-		rows, err := db.QueryContext(
-			ctx,
-			query,
-			opts.AgentID,
-			cfg.Embedder.Name(),
-			pgv.NewVector(eres.Embeddings[0].Embedding),
-			opts.Limit,
-		)
-
-		if err != nil {
-			return nil, err
-		}
-		defer rows.Close()
-
-		res := &ai.RetrieverResponse{}
-		for rows.Next() {
-			var label, content string
-			if err := rows.Scan(&label, &content); err != nil {
-				return nil, err
-			}
-
-			res.Documents = append(
-				res.Documents,
-				ai.DocumentFromText(content, map[string]any{
-					labelKey: label,
-				}),
-			)
-		}
-
-		return res, rows.Err()
-	}
-
-	return genkit.DefineRetriever(g, api.NewName(Provider, cfg.Name), cfg.RetrieverOptions, f)
 }

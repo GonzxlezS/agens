@@ -32,7 +32,7 @@ const (
 	BEGIN
 		FOR mismatch IN
 			WITH expected_layout AS (
-				SELECT * FROM (VALUES 
+				SELECT * FROM (VALUES
 					('id', 'int4'),
 					('agent_id', 'text'),
 					('session_id', 'text'),
@@ -41,16 +41,16 @@ const (
 				) AS t(col_name, col_type)
 			),
 			current_layout AS (
-				SELECT column_name, udt_name 
-				FROM information_schema.columns 
+				SELECT column_name, udt_name
+				FROM information_schema.columns
 				WHERE table_name = '%s' AND table_schema = 'public'
 			)
-			SELECT 
+			SELECT
 				e.col_name,
-				CASE 
-					WHEN c.column_name IS NULL 
+				CASE
+					WHEN c.column_name IS NULL
 						THEN 'MISSING COLUMN'
-					WHEN e.col_type != c.udt_name 
+					WHEN e.col_type != c.udt_name
 						THEN 'INVALID TYPE (expected ' || e.col_type || ', found ' || c.udt_name || ')'
 					ELSE NULL
 				END as error_msg
@@ -74,7 +74,7 @@ const (
 
 	StoreHistoryQueryFormat = `INSERT INTO %s (agent_id, session_id, message) VALUES %s`
 
-	DeleteOldMessagesQueryFormat = `DELETE FROM %s 
+	DeleteOldMessagesQueryFormat = `DELETE FROM %s
 		WHERE id IN (
 			SELECT id FROM %s
 			WHERE agent_id = $1 AND session_id = $2
@@ -96,8 +96,11 @@ var (
 var _ agens.HistoryMemory = &HistoryMemory{}
 
 type HistoryMemory struct {
-	tableName string
-	db        *sql.DB
+	tableName             string
+	db                    *sql.DB
+	stmtDelete            *sql.Stmt
+	stmtRetrieve          *sql.Stmt
+	stmtDeleteOldMessages *sql.Stmt
 }
 
 func NewHistoryMemory(tableName string, db *sql.DB) (*HistoryMemory, error) {
@@ -110,6 +113,7 @@ func NewHistoryMemory(tableName string, db *sql.DB) (*HistoryMemory, error) {
 		return nil, err
 	}
 
+	// transaction
 	tx, err := db.BeginTx(context.Background(), nil)
 	if err != nil {
 		return nil, fmt.Errorf("error starting transaction: %w", err)
@@ -118,23 +122,49 @@ func NewHistoryMemory(tableName string, db *sql.DB) (*HistoryMemory, error) {
 
 	// table
 	query := fmt.Sprintf(CreateHistoryTableQueryFormat, tableName)
-	if _, err := tx.ExecContext(context.Background(), query); err != nil {
+	if _, err := tx.Exec(query); err != nil {
 		return nil, fmt.Errorf("error creating table: %w", err)
 	}
 
 	// check
 	query = fmt.Sprintf(CheckHistorySchemaQueryFormat, tableName)
-	if _, err := tx.ExecContext(context.Background(), query); err != nil {
+	if _, err := tx.Exec(query); err != nil {
 		return nil, err
 	}
 
 	// idx
 	query = fmt.Sprintf(CreateHistoryAgentSessionIndexQueryFormat, tableName)
-	if _, err := tx.ExecContext(context.Background(), query); err != nil {
+	if _, err := tx.Exec(query); err != nil {
 		return nil, fmt.Errorf("error creating index: %w", err)
 	}
 
-	return &HistoryMemory{tableName: tableName, db: db}, tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+
+	// statements
+	stmtDelete, err := db.Prepare(fmt.Sprintf(DeleteHistoryQueryFormat, tableName))
+	if err != nil {
+		return nil, err
+	}
+
+	stmtRetrieve, err := db.Prepare(fmt.Sprintf(RetrieveHistoryQueryFormat, tableName))
+	if err != nil {
+		return nil, err
+	}
+
+	stmtDeleteOldMessages, err := db.Prepare(fmt.Sprintf(DeleteOldMessagesQueryFormat, tableName, tableName))
+	if err != nil {
+		return nil, err
+	}
+
+	return &HistoryMemory{
+		tableName:             tableName,
+		db:                    db,
+		stmtDelete:            stmtDelete,
+		stmtRetrieve:          stmtRetrieve,
+		stmtDeleteOldMessages: stmtDeleteOldMessages,
+	}, nil
 }
 
 func (m *HistoryMemory) DeleteHistory(ctx context.Context, agentID string, sessionID string) error {
@@ -142,8 +172,7 @@ func (m *HistoryMemory) DeleteHistory(ctx context.Context, agentID string, sessi
 		return ErrDBNotInitialized
 	}
 
-	query := fmt.Sprintf(DeleteHistoryQueryFormat, m.tableName)
-	_, err := m.db.ExecContext(ctx, query, agentID, sessionID)
+	_, err := m.stmtDelete.ExecContext(ctx, agentID, sessionID)
 	if err != nil {
 		return fmt.Errorf("error deleting history: %w", err)
 	}
@@ -155,8 +184,7 @@ func (m *HistoryMemory) RetrieveHistory(ctx context.Context, agentID string, ses
 		return nil, ErrDBNotInitialized
 	}
 
-	query := fmt.Sprintf(RetrieveHistoryQueryFormat, m.tableName)
-	rows, err := m.db.QueryContext(ctx, query, agentID, sessionID)
+	rows, err := m.stmtRetrieve.QueryContext(ctx, agentID, sessionID)
 	if err != nil {
 		return nil, fmt.Errorf("error querying history: %w", err)
 	}
@@ -232,18 +260,16 @@ func (m *HistoryMemory) StoreHistory(ctx context.Context, agentID string, sessio
 		vArgs = append(vArgs, agentID, sessionID, msgJSON)
 	}
 
-	stmt := fmt.Sprintf(StoreHistoryQueryFormat, m.tableName, strings.Join(vStrings, ", "))
-
-	if _, err := tx.ExecContext(ctx, stmt, vArgs...); err != nil {
+	query := fmt.Sprintf(StoreHistoryQueryFormat, m.tableName, strings.Join(vStrings, ", "))
+	if _, err := tx.ExecContext(ctx, query, vArgs...); err != nil {
 		return fmt.Errorf("error inserting history: %w", err)
 	}
 
 	// maxMessages
-	query := fmt.Sprintf(DeleteOldMessagesQueryFormat, m.tableName, m.tableName)
-	if _, err := tx.ExecContext(ctx, query, agentID, sessionID, maxMessages); err != nil {
+	_, err = tx.StmtContext(ctx, m.stmtDeleteOldMessages).Exec(agentID, sessionID, maxMessages)
+	if err != nil {
 		return fmt.Errorf("error deleting old messages: %w", err)
 	}
-
 	return tx.Commit()
 }
 
