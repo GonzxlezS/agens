@@ -209,9 +209,24 @@ func DefaultSortMessagesFn(msgs []*ai.Message) ([]*ai.Message, error) {
 	var (
 		result       = make([]*ai.Message, 0, len(msgs))
 		previousRole ai.Role
+
+		msg     *ai.Message
+		nextMsg *ai.Message
 	)
 
-	for _, msg := range msgs {
+	for i := 0; i < len(msgs); i++ {
+		msg = msgs[i]
+
+		if len(result) > 0 {
+			previousRole = result[len(result)-1].Role
+		}
+
+		if i+1 < len(msgs) {
+			nextMsg = msgs[i+1]
+		} else {
+			nextMsg = nil
+		}
+
 		switch {
 		case (previousRole == "") && (msg.Role == ai.RoleUser):
 			result = append(result, msg)
@@ -220,21 +235,35 @@ func DefaultSortMessagesFn(msgs []*ai.Message) ([]*ai.Message, error) {
 			result = append(result, msg)
 
 		case (msg.Role == ai.RoleModel) && (previousRole == ai.RoleUser || previousRole == ai.RoleTool):
-			result = append(result, msg)
+			if hasToolRequests(msg) {
+				if (nextMsg != nil) && (nextMsg.Role == ai.RoleTool) {
+					result = append(result, msg)
 
-		case (msg.Role == ai.RoleTool) && (previousRole == ai.RoleModel):
+					result = append(result, nextMsg)
+					i++
+				}
+
+				continue // discard messages
+			}
+
 			result = append(result, msg)
 
 		default:
-			// discard message
-			continue // keep last msg role
+			continue // discard message
 		}
-
-		previousRole = msg.Role
 	}
 
 	if len(result) == 0 {
 		return nil, ErrNoValidMessages
 	}
 	return result, nil
+}
+
+func hasToolRequests(msg *ai.Message) bool {
+	for _, part := range msg.Content {
+		if part.IsToolRequest() {
+			return true
+		}
+	}
+	return false
 }

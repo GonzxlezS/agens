@@ -4,7 +4,7 @@ go 1.25.1
 
 require (
 	github.com/PaulSonOfLars/gotgbot/v2 v2.0.0-rc.34
-	github.com/firebase/genkit/go v1.5.0
+	github.com/firebase/genkit/go v1.6.0
 	github.com/joho/godotenv v1.5.1
 	github.com/labstack/echo/v4 v4.12.0
 	github.com/lib/pq v1.12.0

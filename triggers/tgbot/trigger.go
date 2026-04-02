@@ -21,6 +21,8 @@ type TriggerOpts struct {
 	DispatcherOpts *ext.DispatcherOpts
 	UpdaterOpts    *ext.UpdaterOpts
 	PollingOpts    *ext.PollingOpts
+
+	DisableDefaultHandlers bool
 }
 
 type Trigger struct {
@@ -60,7 +62,10 @@ func NewTrigger(triggerID string, token string, opts *TriggerOpts) (*Trigger, er
 	}
 
 	trigger.Dispatcher = ext.NewDispatcher(opts.DispatcherOpts)
-	trigger.AddHandler(handlers.NewMessage(message.Text, trigger.TextHandler))
+
+	if !opts.DisableDefaultHandlers {
+		trigger.AddHandler(handlers.NewMessage(message.Text, trigger.TextHandler))
+	}
 
 	trigger.Updater = ext.NewUpdater(trigger.Dispatcher, opts.UpdaterOpts)
 

@@ -64,6 +64,8 @@ const (
 )
 
 const (
+	DeleteAgentHistoriesQueryFormat = `DELETE FROM %s WHERE agent_id = $1`
+
 	DeleteHistoryQueryFormat = `DELETE FROM %s WHERE agent_id = $1 AND session_id = $2`
 
 	RetrieveHistoryQueryFormat = `SELECT id, message
@@ -98,6 +100,7 @@ var _ agens.HistoryMemory = &HistoryMemory{}
 type HistoryMemory struct {
 	tableName             string
 	db                    *sql.DB
+	stmtDeleteAll         *sql.Stmt
 	stmtDelete            *sql.Stmt
 	stmtRetrieve          *sql.Stmt
 	stmtDeleteOldMessages *sql.Stmt
@@ -143,6 +146,11 @@ func NewHistoryMemory(tableName string, db *sql.DB) (*HistoryMemory, error) {
 	}
 
 	// statements
+	stmtDeleteAll, err := db.Prepare(fmt.Sprintf(DeleteAgentHistoriesQueryFormat, tableName))
+	if err != nil {
+		return nil, err
+	}
+
 	stmtDelete, err := db.Prepare(fmt.Sprintf(DeleteHistoryQueryFormat, tableName))
 	if err != nil {
 		return nil, err
@@ -161,10 +169,23 @@ func NewHistoryMemory(tableName string, db *sql.DB) (*HistoryMemory, error) {
 	return &HistoryMemory{
 		tableName:             tableName,
 		db:                    db,
+		stmtDeleteAll:         stmtDeleteAll,
 		stmtDelete:            stmtDelete,
 		stmtRetrieve:          stmtRetrieve,
 		stmtDeleteOldMessages: stmtDeleteOldMessages,
 	}, nil
+}
+
+func (m *HistoryMemory) DeleteAgentHistories(ctx context.Context, agentID string) error {
+	if m.db == nil {
+		return ErrDBNotInitialized
+	}
+
+	_, err := m.stmtDeleteAll.ExecContext(ctx, agentID)
+	if err != nil {
+		return fmt.Errorf("error deleting history: %w", err)
+	}
+	return nil
 }
 
 func (m *HistoryMemory) DeleteHistory(ctx context.Context, agentID string, sessionID string) error {

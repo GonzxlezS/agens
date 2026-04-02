@@ -434,6 +434,12 @@ func TestSortMessagesFn(t *testing.T) {
 		modelMsg2 = ai.NewModelTextMessage("test 2")
 		modelMsg3 = ai.NewModelTextMessage("test 3")
 
+		toolReqMsg = ai.NewModelMessage(
+			ai.NewToolRequestPart(&ai.ToolRequest{
+				Name: "test",
+			}),
+		)
+
 		toolMsg  = ai.NewMessage(ai.RoleTool, nil, nil)
 		toolMsg2 = ai.NewMessage(ai.RoleTool, nil, nil)
 
@@ -448,17 +454,18 @@ func TestSortMessagesFn(t *testing.T) {
 			systemMsg,
 			modelMsg,
 			userMsg2,
-			modelMsg2,
+			toolReqMsg,
 			toolMsg2,
 			modelMsg3,
 			userMsg3,
+			toolReqMsg,
 		}
 
 		outMessages = []*ai.Message{
 			userMsg,
 			modelMsg,
 			userMsg2,
-			modelMsg2,
+			toolReqMsg,
 			toolMsg2,
 			modelMsg3,
 			userMsg3,
