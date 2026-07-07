@@ -5,10 +5,11 @@ import (
 	"encoding/json"
 	"strconv"
 
+	"github.com/gonzxlezs/agens"
+
 	"github.com/PaulSonOfLars/gotgbot/v2"
 	"github.com/PaulSonOfLars/gotgbot/v2/ext"
 	"github.com/firebase/genkit/go/ai"
-	"github.com/gonzxlezs/agens"
 )
 
 const OutputExampleTextMessage = `Output Example:
@@ -46,60 +47,61 @@ type MessageResponses struct {
 	Messages []*MessageResponse `json:"messages" jsonschema:"description=List of messages to be sent via the Telegram bot,minItems=1,required"`
 }
 
-func (trigger *Trigger) TextHandler(_ *gotgbot.Bot, tgCtx *ext.Context) error {
-	jsonMsg, err := json.Marshal(tgCtx.Update.Message)
+type TextProcessor struct {
+	bot *gotgbot.Bot
+}
+
+func NewTextProcessor(g *TgGateway) *TextProcessor {
+	return &TextProcessor{bot: g.Bot}
+}
+
+func (p *TextProcessor) OriginalInputToMessage(ctx context.Context, state *agens.PipelineState[*ext.Context]) (string, *ai.Message, error) {
+	var u = state.OriginalInput()
+
+	jsonMsg, err := json.Marshal(u.Update.Message)
 	if err != nil {
-		return err
+		return "", nil, err
 	}
 
+	var chatID = strconv.FormatInt(u.EffectiveChat.Id, 10)
+
+	return chatID, ai.NewUserTextMessage(string(jsonMsg)), nil
+}
+
+func (p *TextProcessor) BatchToInput(ctx context.Context, state *agens.PipelineState[*ext.Context]) (*agens.Input, error) {
 	var (
-		chatID = tgCtx.EffectiveChat.Id
-		source = strconv.FormatInt(chatID, 10)
+		u = state.OriginalInput()
 
-		msg = ai.NewUserTextMessage(string(jsonMsg))
-
-		ctx = context.Background()
+		chatID   = strconv.FormatInt(u.EffectiveChat.Id, 10)
+		senderID = strconv.FormatInt(u.EffectiveSender.Id(), 10)
 	)
 
-	// batch
-	var batch = []*ai.Message{msg}
-
-	if trigger.Batcher != nil {
-		batch, err = trigger.Batcher.Add(ctx, source, msg)
-		if err != nil {
-			return err
-		}
-
-		// delegated
-		if len(batch) == 0 {
-			return nil
-		}
+	in := &agens.Input{
+		GatewayID: state.Gateway().ID(),
+		SessionID: chatID,
+		SenderID:  senderID,
 	}
 
-	// input
-	input := &agens.Input{
-		Trigger:                trigger.TriggerID,
-		Source:                 source,
-		Messages:               batch,
-		AdditionalSystemPrompt: OutputExampleTextMessage,
-	}
+	in = in.
+		WithMessages(state.BatchMessages()...).
+		WithOutputType(MessageResponses{}).
+		WithOutputInstructions(OutputExampleTextMessage)
 
-	input = input.WithOutputType(MessageResponses{})
+	return in, nil
+}
 
-	// generate
-	resp, err := trigger.Agent.Generate(ctx, input)
-	if err != nil {
-		return err
-	}
+func (p *TextProcessor) HandleAgentResponse(ctx context.Context, state *agens.PipelineState[*ext.Context]) error {
+	var (
+		resp   = state.AgentResponse()
+		u      = state.OriginalInput()
+		params MessageResponses
+	)
 
-	// output
-	var params MessageResponses
 	if err := resp.Output(&params); err != nil {
 		return err
 	}
 
-	// send
-	return sendMessage(trigger.Bot, chatID, params.Messages)
+	return sendMessage(p.bot, u.EffectiveChat.Id, params.Messages)
 }
 
 func sendMessage(bot *gotgbot.Bot, chatID int64, sendParams []*MessageResponse) error {

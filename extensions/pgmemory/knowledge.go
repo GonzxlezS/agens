@@ -2,19 +2,24 @@ package pgmemory
 
 import (
 	"context"
-	"crypto/sha256"
 	"database/sql"
+	"errors"
 	"fmt"
+	"time"
+
+	"github.com/gonzxlezs/agens"
+	"github.com/lib/pq"
 
 	"github.com/firebase/genkit/go/ai"
-	"github.com/firebase/genkit/go/genkit"
-	"github.com/gonzxlezs/agens"
+	"github.com/firebase/genkit/go/core/api"
 	pgv "github.com/pgvector/pgvector-go"
 )
 
-const (
-	TableNameFormat = "knowledge_embeddings_%d"
+const Provider = "pgmemory"
 
+var ErrEmbedderRequired = errors.New("pgmemory: embedder is required")
+
+const (
 	CreateKnowledgeEmbeddingsQueryFormat = `CREATE EXTENSION IF NOT EXISTS vector;
 	CREATE TABLE IF NOT EXISTS %s (
 		id SERIAL PRIMARY KEY,
@@ -31,7 +36,7 @@ const (
 
 	CreateKnowledgeHashIndexQueryFormat = `CREATE INDEX IF NOT EXISTS idx_%s_hash ON %s (agent_id, embedder_name, content_hash)`
 
-	CreateKnowledgeIvfflatIndexQueryFormat = `CREATE INDEX IF NOT EXISTS idx_%s_ivfflat ON %s USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100)`
+	CreateKnowledgeHNSWIndexQueryFormat = `CREATE INDEX IF NOT EXISTS idx_%s_hnsw ON %s USING hnsw (embedding vector_cosine_ops)`
 )
 
 const (
@@ -87,18 +92,16 @@ const (
 		embedding
 	) VALUES ($1, $2, $3, $4, $5, $6)`
 
-	IsIndexedQueryFormat = `SELECT EXISTS(
-        SELECT 1 FROM %s
-            WHERE agent_id = $1
-            AND embedder_name = $2
-            AND label = $3
-            AND content_hash = $4
-    )`
+	CheckHashesQueryFormat = `SELECT content_hash FROM %s
+		WHERE agent_id = $1
+			AND embedder_name = $2
+			AND label = $3
+			AND content_hash = ANY($4)`
 
 	RetrieveKnowledgeQueryFormat = `SELECT label, content
 		FROM %s
 		WHERE agent_id = $1 AND embedder_name = $2
-		ORDER BY embedding <#> $3 LIMIT $4`
+		ORDER BY embedding <=> $3 LIMIT $4`
 
 	ReassignKnowledgeQueryFormat = `UPDATE %s
 		SET agent_id = $1
@@ -107,28 +110,50 @@ const (
 
 var _ agens.KnowledgeMemory = &KnowledgeMemory{}
 
+type KnowledgeMemoryConfig struct {
+	Name        string
+	Description string
+
+	Embedder         ai.EmbedderArg
+	Dimensions       int
+	RetrieverOptions *ai.RetrieverOptions
+
+	DB      *sql.DB
+	Timeout time.Duration
+	OwnsDB  bool
+}
+
 type KnowledgeMemory struct {
-	g         *genkit.Genkit
+	cfg       *KnowledgeMemoryConfig
 	retriever ai.Retriever
+	reg       api.Registry
+	tool      *ai.ToolDef[KnowledgeQuery, KnowledgeResponse]
 
-	cfg *KnowledgeMemoryConfig
-
-	db            *sql.DB
 	stmtDelete    *sql.Stmt
 	stmtIndex     *sql.Stmt
-	stmtIsIndexed *sql.Stmt
+	stmtCheckHash *sql.Stmt
+	stmtRetrieve  *sql.Stmt
 	stmtReassign  *sql.Stmt
 }
 
-func NewKnowledgeMemory(g *genkit.Genkit, db *sql.DB, cfg KnowledgeMemoryConfig) (*KnowledgeMemory, error) {
-	tableName := fmt.Sprintf(TableNameFormat, cfg.Dimensions)
+func NewKnowledgeMemory(cfg KnowledgeMemoryConfig) (*KnowledgeMemory, error) {
+	if cfg.Embedder == nil {
+		return nil, ErrEmbedderRequired
+	}
 
-	if err := db.Ping(); err != nil {
+	// table name
+	tableName, err := knowledgeTableName(cfg.Dimensions)
+	if err != nil {
+		return nil, err
+	}
+
+	// ping
+	if err := cfg.DB.Ping(); err != nil {
 		return nil, err
 	}
 
 	// transaction
-	tx, err := db.BeginTx(context.Background(), nil)
+	tx, err := cfg.DB.Begin()
 	if err != nil {
 		return nil, fmt.Errorf("error starting transaction: %w", err)
 	}
@@ -157,7 +182,7 @@ func NewKnowledgeMemory(g *genkit.Genkit, db *sql.DB, cfg KnowledgeMemoryConfig)
 		return nil, fmt.Errorf("error creating index: %w", err)
 	}
 
-	query = fmt.Sprintf(CreateKnowledgeIvfflatIndexQueryFormat, tableName, tableName)
+	query = fmt.Sprintf(CreateKnowledgeHNSWIndexQueryFormat, tableName, tableName)
 	if _, err := tx.Exec(query); err != nil {
 		return nil, fmt.Errorf("error creating index: %w", err)
 	}
@@ -166,50 +191,57 @@ func NewKnowledgeMemory(g *genkit.Genkit, db *sql.DB, cfg KnowledgeMemoryConfig)
 		return nil, err
 	}
 
-	// statements
-	stmtDelete, err := db.Prepare(fmt.Sprintf(DeleteByLabelQueryFormat, tableName))
-	if err != nil {
+	// timeout
+	if cfg.Timeout <= 0 {
+		cfg.Timeout = DefaultTimeout
+	}
+
+	// retriever
+	memory := &KnowledgeMemory{cfg: &cfg}
+
+	if err := memory.prepareStmts(tableName); err != nil {
 		return nil, err
 	}
 
-	stmtIndex, err := db.Prepare(fmt.Sprintf(IndexKnowledgeQueryFormat, tableName))
-	if err != nil {
-		return nil, err
-	}
+	memory.retriever = ai.NewRetriever(
+		api.NewName(Provider, cfg.Name),
+		cfg.RetrieverOptions,
+		memory.retrieverFn,
+	)
 
-	stmtIsIndexed, err := db.Prepare(fmt.Sprintf(IsIndexedQueryFormat, tableName))
-	if err != nil {
-		return nil, err
-	}
-
-	stmtRetrieve, err := db.Prepare(fmt.Sprintf(RetrieveKnowledgeQueryFormat, tableName))
-	if err != nil {
-		return nil, err
-	}
-
-	stmtReassign, err := db.Prepare(fmt.Sprintf(ReassignKnowledgeQueryFormat, tableName))
-	if err != nil {
-		return nil, err
-	}
-
-	return &KnowledgeMemory{
-		g:             g,
-		db:            db,
-		cfg:           &cfg,
-		retriever:     defineRetriever(g, &cfg, stmtRetrieve),
-		stmtDelete:    stmtDelete,
-		stmtIndex:     stmtIndex,
-		stmtIsIndexed: stmtIsIndexed,
-		stmtReassign:  stmtReassign,
-	}, nil
+	return memory, nil
 }
 
-func (m *KnowledgeMemory) DeleteKnowledge(ctx context.Context, agentID string, label string) error {
-	if m.db == nil {
+// Close releases the resources of all prepared statements
+// associated with KnowledgeMemory to prevent memory leaks and open database connections.
+func (m *KnowledgeMemory) Close() error {
+	if (m.cfg == nil) || (m.cfg.DB == nil) {
 		return ErrDBNotInitialized
 	}
 
-	_, err := m.stmtDelete.ExecContext(ctx, agentID, m.cfg.Embedder.Name(), label)
+	err := m.closeStmts()
+
+	if m.cfg.OwnsDB {
+		errDB := m.cfg.DB.Close()
+
+		if errDB != nil {
+			err = errors.Join(err, errDB)
+		}
+	}
+
+	return err
+}
+
+func (m *KnowledgeMemory) DeleteKnowledge(ctx context.Context, agentID string, label string) error {
+	if (m.cfg == nil) || (m.cfg.DB == nil) {
+		return ErrDBNotInitialized
+	}
+
+	// Timeout
+	dbCtx, cancel := context.WithTimeout(ctx, m.cfg.Timeout)
+	defer cancel()
+
+	_, err := m.stmtDelete.ExecContext(dbCtx, agentID, m.cfg.Embedder.Name(), label)
 	if err != nil {
 		return fmt.Errorf("error deleting knowledge: %w", err)
 	}
@@ -217,16 +249,18 @@ func (m *KnowledgeMemory) DeleteKnowledge(ctx context.Context, agentID string, l
 }
 
 func (m *KnowledgeMemory) IndexKnowledge(ctx context.Context, agentID string, label string, docs []*ai.Document) error {
-	if m.db == nil {
+	if (m.cfg == nil) || (m.cfg.DB == nil) {
 		return ErrDBNotInitialized
 	}
 
+	// hash
 	var (
-		docsToEmbed   []*ai.Document
-		hashesToEmbed []string
+		hashes         []string
+		hashToDocIndex = make(map[string]int)
+		hashToDocText  = make(map[string]string)
 	)
 
-	for _, doc := range docs {
+	for i, doc := range docs {
 		content := documentToText(doc)
 		if content == "" {
 			continue
@@ -234,29 +268,45 @@ func (m *KnowledgeMemory) IndexKnowledge(ctx context.Context, agentID string, la
 
 		cHash := calculateHash(content)
 
-		exists, err := m.isIndexed(ctx, agentID, label, cHash)
-		if err != nil {
-			return err
-		}
-
-		if !exists {
-			docsToEmbed = append(docsToEmbed, doc)
-			hashesToEmbed = append(hashesToEmbed, cHash)
-		}
+		hashToDocIndex[cHash] = i
+		hashToDocText[cHash] = content
+		hashes = append(hashes, cHash)
 	}
 
-	if len(docsToEmbed) == 0 {
+	if len(hashes) == 0 {
 		return nil
 	}
 
-	res, err := genkit.Embed(
-		ctx,
-		m.g,
-		m.cfg.embedderOptions(
-			ai.WithDocs(docsToEmbed...),
-		)...,
+	// timeout
+	dbCtx, cancel := context.WithTimeout(ctx, m.cfg.Timeout)
+	defer cancel()
+
+	existsMap, err := m.checkHashes(dbCtx, agentID, label, hashes)
+	if err != nil {
+		return err
+	}
+
+	// filter
+	var (
+		hashesToEmbed []string
+		docsToEmbed   []*ai.Document
 	)
 
+	for _, hash := range hashes {
+		if !existsMap[hash] {
+			hashesToEmbed = append(hashesToEmbed, hash)
+
+			docIndex := hashToDocIndex[hash]
+			docsToEmbed = append(docsToEmbed, docs[docIndex])
+		}
+	}
+
+	if len(hashesToEmbed) == 0 {
+		return nil
+	}
+
+	// embed
+	res, err := m.Embed(dbCtx, ai.WithDocs(docsToEmbed...))
 	if err != nil {
 		return err
 	}
@@ -264,11 +314,13 @@ func (m *KnowledgeMemory) IndexKnowledge(ctx context.Context, agentID string, la
 	var embedderName = m.cfg.Embedder.Name()
 
 	for i, emb := range res.Embeddings {
-		content := documentToText(docsToEmbed[i])
-		currentHash := hashesToEmbed[i]
-		embedding := pgv.NewVector(emb.Embedding)
+		var (
+			currentHash = hashesToEmbed[i]
+			content     = hashToDocText[currentHash]
+			embedding   = pgv.NewVector(emb.Embedding)
+		)
 
-		_, err := m.stmtIndex.ExecContext(ctx, agentID, embedderName, label, content, currentHash, embedding)
+		_, err := m.stmtIndex.ExecContext(dbCtx, agentID, embedderName, label, content, currentHash, embedding)
 		if err != nil {
 			return err
 		}
@@ -277,33 +329,128 @@ func (m *KnowledgeMemory) IndexKnowledge(ctx context.Context, agentID string, la
 	return nil
 }
 
-func (m *KnowledgeMemory) isIndexed(ctx context.Context, agentID string, label string, content_hash string) (bool, error) {
-	if m.db == nil {
-		return false, ErrDBNotInitialized
+func (m *KnowledgeMemory) checkHashes(ctx context.Context, agentID string, label string, hashes []string) (map[string]bool, error) {
+	rows, err := m.stmtCheckHash.QueryContext(ctx, agentID, m.cfg.Embedder.Name(), label, pq.Array(hashes))
+	if err != nil {
+		return nil, fmt.Errorf("error checking batch existence: %w", err)
+	}
+	defer rows.Close()
+
+	existsMap := make(map[string]bool)
+	for rows.Next() {
+		var hash string
+		if err := rows.Scan(&hash); err != nil {
+			return nil, err
+		}
+		existsMap[hash] = true
 	}
 
-	var exists bool
-	err := m.stmtIsIndexed.QueryRowContext(ctx, agentID, m.cfg.Embedder.Name(), label, content_hash).Scan(&exists)
-	if err != nil {
-		return false, fmt.Errorf("database error: %v", err)
-	}
-	return exists, nil
+	return existsMap, rows.Err()
 }
 
 func (m *KnowledgeMemory) ReassignKnowledge(ctx context.Context, fromAgentID string, label string, toAgentID string) error {
-	if m.db == nil {
+	if (m.cfg == nil) || (m.cfg.DB == nil) {
 		return ErrDBNotInitialized
 	}
 
-	_, err := m.stmtReassign.ExecContext(ctx, toAgentID, fromAgentID, label)
+	// Timeout
+	dbCtx, cancel := context.WithTimeout(ctx, m.cfg.Timeout)
+	defer cancel()
+
+	_, err := m.stmtReassign.ExecContext(dbCtx, toAgentID, fromAgentID, label)
 	if err != nil {
 		return fmt.Errorf("failed to reassign knowledge: %w", err)
 	}
 	return nil
 }
 
-func calculateHash(content string) string {
-	h := sha256.New()
-	h.Write([]byte(content))
-	return fmt.Sprintf("%x", h.Sum(nil))
+func (m *KnowledgeMemory) Register(r api.Registry) {
+	m.reg = r
+	m.retriever.Register(r)
+}
+
+func (m *KnowledgeMemory) closeStmts() error {
+	var errs []error
+
+	if m.stmtDelete != nil {
+		err := m.stmtDelete.Close()
+		if err != nil {
+			errs = append(errs, fmt.Errorf("error closing stmtDelete: %w", err))
+		}
+	}
+	if m.stmtIndex != nil {
+		err := m.stmtIndex.Close()
+		if err != nil {
+			errs = append(errs, fmt.Errorf("error closing stmtIndex: %w", err))
+		}
+	}
+	if m.stmtCheckHash != nil {
+		err := m.stmtCheckHash.Close()
+		if err != nil {
+			errs = append(errs, fmt.Errorf("error closing stmtCheckHash: %w", err))
+		}
+	}
+	if m.stmtRetrieve != nil {
+		err := m.stmtRetrieve.Close()
+		if err != nil {
+			errs = append(errs, fmt.Errorf("error closing stmtRetrieve: %w", err))
+		}
+	}
+	if m.stmtReassign != nil {
+		err := m.stmtReassign.Close()
+		if err != nil {
+			errs = append(errs, fmt.Errorf("error closing stmtReassign: %w", err))
+		}
+	}
+
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
+	return nil
+}
+
+func (m *KnowledgeMemory) prepareStmts(tableName string) error {
+	var err error
+
+	// stmtDelete
+	stmtDelete, err := m.cfg.DB.Prepare(fmt.Sprintf(DeleteByLabelQueryFormat, tableName))
+	if err != nil {
+		m.closeStmts()
+		return fmt.Errorf("error preparing stmtDelete: %w", err)
+	}
+	m.stmtDelete = stmtDelete
+
+	// stmtIndex
+	stmtIndex, err := m.cfg.DB.Prepare(fmt.Sprintf(IndexKnowledgeQueryFormat, tableName))
+	if err != nil {
+		m.closeStmts()
+		return fmt.Errorf("error preparing stmtIndex: %w", err)
+	}
+	m.stmtIndex = stmtIndex
+
+	// stmtCheckHash
+	stmtCheckHash, err := m.cfg.DB.Prepare(fmt.Sprintf(CheckHashesQueryFormat, tableName))
+	if err != nil {
+		m.closeStmts()
+		return fmt.Errorf("error preparing stmtCheckHash: %w", err)
+	}
+	m.stmtCheckHash = stmtCheckHash
+
+	// stmtRetrieve
+	stmtRetrieve, err := m.cfg.DB.Prepare(fmt.Sprintf(RetrieveKnowledgeQueryFormat, tableName))
+	if err != nil {
+		m.closeStmts()
+		return fmt.Errorf("error preparing stmtRetrieve: %w", err)
+	}
+	m.stmtRetrieve = stmtRetrieve
+
+	// stmtReassign
+	stmtReassign, err := m.cfg.DB.Prepare(fmt.Sprintf(ReassignKnowledgeQueryFormat, tableName))
+	if err != nil {
+		m.closeStmts()
+		return fmt.Errorf("error preparing stmtReassign: %w", err)
+	}
+	m.stmtReassign = stmtReassign
+
+	return nil
 }

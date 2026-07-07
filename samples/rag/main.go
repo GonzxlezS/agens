@@ -16,8 +16,8 @@ import (
 	"github.com/firebase/genkit/go/plugins/ollama"
 	"github.com/gonzxlezs/agens"
 	"github.com/gonzxlezs/agens/extensions/pgmemory"
+	"github.com/gonzxlezs/agens/extensions/tgbot"
 	"github.com/gonzxlezs/agens/extensions/timedbatcher"
-	"github.com/gonzxlezs/agens/triggers/tgbot"
 	_ "github.com/lib/pq"
 	"google.golang.org/genai"
 
@@ -65,7 +65,7 @@ func main() {
 	)
 
 	model := googlegenai.ModelRef(
-		"googleai/gemini-2.5-flash",
+		"googleai/gemini-3.1-flash-lite",
 		&genai.GenerateContentConfig{
 			MaxOutputTokens: 500,
 			Temperature:     genai.Ptr[float32](0.5),
@@ -101,30 +101,34 @@ func main() {
 		panic(err)
 	}
 
-	historyMemory, err := pgmemory.NewHistoryMemory("history", db)
+	historyMemory, err := pgmemory.NewHistoryMemory(pgmemory.HistoryMemoryConfig{
+		TableName: "history",
+		DB:        db,
+	})
 	if err != nil {
 		panic(err)
 	}
+	defer historyMemory.Close()
 
-	knowledgeProvider, err := pgmemory.NewKnowledgeMemory(
-		g,
-		db,
-		pgmemory.KnowledgeMemoryConfig{
-			Name: "knowledge",
-			Description: "USE THIS TOOL when the user asks for information about errors in the agens framework;" +
-				" it returns definitions of the errors.",
-			Embedder:   embedder,
-			Dimensions: 768,
-		},
-	)
+	knowledgeProvider, err := pgmemory.NewKnowledgeMemory(pgmemory.KnowledgeMemoryConfig{
+		Name: "knowledge",
+		Description: "USE THIS TOOL when the user asks for information about errors in the agens framework;" +
+			" it returns definitions of the errors.",
+		Embedder:   embedder,
+		Dimensions: 768,
+		DB:         db,
+	})
 
 	if err != nil {
 		panic(err)
 	}
+	defer knowledgeProvider.Close()
+
+	genkit.RegisterAction(g, knowledgeProvider)
 
 	// Agent
-	e21, err := agens.NewAgent(g, agens.AgentConfig{
-		ID:          "agent02",
+	e21, err := agens.NewAgent(agens.AgentConfig{
+		ID:          "rag_agent1",
 		Name:        "e21",
 		Description: "General purpose virtual assistant for developers.",
 		Instructions: []string{
@@ -132,9 +136,11 @@ func main() {
 			"Do not assume or invent errors; always consult the error knowledge tool.",
 			"Explain the error clearly and suggest a fix based on the documentation found.",
 		},
-		Model:                  model,
-		HistoryMemory:          historyMemory,
-		HistoryMemorySize:      5,
+		Model:         model,
+		HistoryMemory: historyMemory,
+		HistoryManager: agens.SlidingWindowManager{
+			WindowSize: 10,
+		},
 		KnowledgeMemory:        knowledgeProvider,
 		KnowledgeRetrieveLimit: 1,
 	})
@@ -143,7 +149,10 @@ func main() {
 		panic(err)
 	}
 
-	err = e21.IndexKnowledge(ctx, "agens_errors", []*ai.Document{
+	genkit.RegisterAction(g, e21)
+
+	// Index knowledge
+	err = knowledgeProvider.IndexKnowledge(ctx, e21.ID(), "agens_errors", []*ai.Document{
 		ai.DocumentFromText(agensErrorsP1, nil),
 		ai.DocumentFromText(agensErrorsP2, nil),
 		ai.DocumentFromText(agensErrorsP3, nil),
@@ -153,50 +162,49 @@ func main() {
 		panic(err)
 	}
 
-	// Telegram bot trigger
-	tgTrigger, err := tgbot.NewTrigger(
-		"tgbot02",
-		TGBOT_TOKEN,
-		&tgbot.TriggerOpts{
-			DispatcherOpts: &ext.DispatcherOpts{
-				Error: func(b *gotgbot.Bot, ctx *ext.Context, err error) ext.DispatcherAction {
-					log.Println(err.Error())
-					return ext.DispatcherActionNoop
-				},
-				MaxRoutines: ext.DefaultMaxRoutines,
+	// Telegram bot
+	gateway, err := tgbot.NewTgGateway(tgbot.TgGatewayConfig{
+		ID:    "tgbot01",
+		Token: TGBOT_TOKEN,
+		DispatcherOpts: &ext.DispatcherOpts{
+			Error: func(b *gotgbot.Bot, ctx *ext.Context, err error) ext.DispatcherAction {
+				log.Println(err.Error())
+				return ext.DispatcherActionNoop
 			},
-			PollingOpts: &ext.PollingOpts{
-				DropPendingUpdates: true,
-				GetUpdatesOpts: &gotgbot.GetUpdatesOpts{
-					Timeout: 9,
-					RequestOpts: &gotgbot.RequestOpts{
-						Timeout: time.Second * 10,
-					},
-				},
-			},
+			MaxRoutines: ext.DefaultMaxRoutines,
 		},
-	)
+	})
 
 	if err != nil {
 		panic(err)
 	}
 
-	if err := tgTrigger.RegisterAgent(e21); err != nil {
+	if err := gateway.RegisterAgent(e21); err != nil {
 		panic(err)
 	}
 
 	batcher := &timedbatcher.TimedBatcher{Duration: 5 * time.Second}
-	if err := tgTrigger.WithBatcher(batcher); err != nil {
+	if err := gateway.WithMessageBatcher(batcher); err != nil {
 		panic(err)
 	}
 
 	// start
-	if err := tgbot.StartPolling(tgTrigger); err != nil {
+	err = gateway.StartPolling(&ext.PollingOpts{
+		DropPendingUpdates: true,
+		GetUpdatesOpts: &gotgbot.GetUpdatesOpts{
+			Timeout: 9,
+			RequestOpts: &gotgbot.RequestOpts{
+				Timeout: time.Second * 10,
+			},
+		},
+	})
+
+	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("%s has been started...\n", tgTrigger.Bot.User.Username)
+	fmt.Printf("%s has been started...\n", gateway.Bot.User.Username)
 
-	select {}
+	gateway.IDLE()
 }
 
 const agensErrorsP1 = `agens errors (v0.4.0):

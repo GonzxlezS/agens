@@ -2,6 +2,7 @@ package timedbatcher
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -30,22 +31,24 @@ func TestTimedBatcher_Add(t *testing.T) {
 		}
 	)
 
-	wg.Go(func() {
-		bacth, err := batcher.Add(ctx, batchID, msg1)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		batch, err := batcher.Add(ctx, batchID, msg1)
 		if err != nil {
 			t.Errorf("unexpected error in Add 1: %v", err)
 		}
 
-		receivedBatch = bacth
-	})
+		receivedBatch = batch
+	}()
 
-	time.Sleep(20 * time.Millisecond) // delay
+	time.Sleep(20 * time.Millisecond) // intentional delay
 
 	batch, err := batcher.Add(ctx, batchID, msg2)
 	if err != nil {
 		t.Errorf("unexpected error in Add 2: %v", err)
 	} else if batch != nil {
-		t.Error("batch must be nil")
+		t.Error("batch must be nil for subsequent requests")
 	}
 
 	wg.Wait()
@@ -57,7 +60,7 @@ func TestTimedBatcher_Add(t *testing.T) {
 	for i, msg := range receivedBatch {
 		txt := msg.Content[0].Text
 		if txt != expectedTexts[i] {
-			t.Errorf("Invalid message %d. Expected: %s, Received: %s", i, expectedTexts[i], txt)
+			t.Errorf("Invalid message at index %d. Expected: %s, Received: %s", i, expectedTexts[i], txt)
 		}
 	}
 }
@@ -94,5 +97,44 @@ func TestTimedBatcher_MultipleBatches(t *testing.T) {
 
 	if len(r2) != 1 || r2[0].Content[0].Text != "B1" {
 		t.Errorf("Batch B was not processed correctly: %v", r2)
+	}
+}
+
+func TestTimedBatcher_Errors(t *testing.T) {
+	batcher := &TimedBatcher{Duration: 50 * time.Millisecond}
+	ctx := context.Background()
+
+	_, err := batcher.Add(ctx, "", &ai.Message{})
+	if !errors.Is(err, ErrEmptyBatchID) {
+		t.Errorf("expected ErrEmptyBatchID, got %v", err)
+	}
+
+	_, err = batcher.Add(ctx, "invalid-batch", nil)
+	if !errors.Is(err, ErrNilMessage) {
+		t.Errorf("expected ErrNilMessage, got %v", err)
+	}
+}
+
+func TestTimedBatcher_ContextCancellation(t *testing.T) {
+	batcher := &TimedBatcher{Duration: 500 * time.Millisecond}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	msg := &ai.Message{Content: []*ai.Part{ai.NewTextPart("Timeout Target")}}
+
+	startTime := time.Now()
+	_, err := batcher.Add(ctx, "timeout-batch", msg)
+
+	if err == nil {
+		t.Fatal("expected a context deadline error, but received nil")
+	}
+
+	if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+		t.Errorf("expected context cancellation error, instead received: %v", err)
+	}
+
+	if time.Since(startTime) >= 500*time.Millisecond {
+		t.Errorf("Add method blocked execution for too long, ignoring context cancellation")
 	}
 }

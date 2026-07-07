@@ -3,10 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
-	"errors"
-	"fmt"
 	"log"
-	"net/http"
 	"os"
 	"time"
 
@@ -15,7 +12,8 @@ import (
 	"github.com/gonzxlezs/agens"
 	"github.com/gonzxlezs/agens/extensions/pgmemory"
 	"github.com/gonzxlezs/agens/extensions/timedbatcher"
-	"github.com/gonzxlezs/agens/triggers/wabot"
+	"github.com/gonzxlezs/agens/extensions/wabot"
+	"github.com/labstack/echo/v4"
 	_ "github.com/lib/pq"
 	wapi "github.com/wapikit/wapi.go/pkg/client"
 	"google.golang.org/genai"
@@ -82,67 +80,66 @@ func main() {
 		panic(err)
 	}
 
-	historyMemory, err := pgmemory.NewHistoryMemory("history", db)
+	historyMemory, err := pgmemory.NewHistoryMemory(pgmemory.HistoryMemoryConfig{
+		TableName: "history",
+		DB:        db,
+		OwnsDB:    true,
+	})
 	if err != nil {
 		panic(err)
 	}
+	defer historyMemory.Close()
 
 	// Agent
-	e21, err := agens.NewAgent(g, agens.AgentConfig{
-		ID:          "agentWA01",
+	e21, err := agens.NewAgent(agens.AgentConfig{
+		ID:          "wa_agent1",
 		Name:        "e21",
 		Description: "a general-purpose virtual assistant",
 		Instructions: []string{
 			"You receive messages from users via a WhatsApp bot and must respond to their messages.",
 		},
-		Model:             model,
-		HistoryMemory:     historyMemory,
-		HistoryMemorySize: 10,
+		Model:         model,
+		HistoryMemory: historyMemory,
+		HistoryManager: agens.SlidingWindowManager{
+			WindowSize: 10,
+		},
 	})
 
 	if err != nil {
 		panic(err)
 	}
 
-	// Whatsapp bot trigger
-	waTrigger, err := wabot.NewWebhookTrigger("wa01", &wapi.ClientConfig{
-		BusinessAccountId: WA_BUSINESS_ID,
-		ApiAccessToken:    WA_TOKEN,
-		WebhookSecret:     WEBHOOK_SECRET,
+	genkit.RegisterAction(g, e21)
+
+	// Whatsapp
+	gateway, err := wabot.NewWAGateway(wabot.WAGatewayConfig{
+		ID: "wa01",
+		ClientConfig: &wapi.ClientConfig{
+			BusinessAccountId: WA_BUSINESS_ID,
+			ApiAccessToken:    WA_TOKEN,
+			WebhookSecret:     WEBHOOK_SECRET,
+		},
 	})
 
 	if err != nil {
 		panic(err)
 	}
 
-	if err := waTrigger.RegisterAgent(e21); err != nil {
+	if err := gateway.RegisterAgent(e21); err != nil {
 		panic(err)
 	}
 
 	batcher := &timedbatcher.TimedBatcher{Duration: 10 * time.Second}
-	if err := waTrigger.WithBatcher(batcher); err != nil {
+	if err := gateway.WithMessageBatcher(batcher); err != nil {
 		panic(err)
 	}
 
 	// server
-	mux := http.NewServeMux()
-	for _, route := range waTrigger.GetRoutes() {
-		pattern := fmt.Sprintf("%s %s", route.Method, route.Path)
-		fmt.Println(pattern)
-		mux.HandleFunc(pattern, route.Handler)
+	server := echo.New()
+
+	for _, route := range gateway.WebhookRoutes() {
+		server.Add(route.Method, route.Path, route.Handler)
 	}
 
-	server := &http.Server{
-		Addr:    ":" + PORT,
-		Handler: mux,
-	}
-
-	fmt.Printf("Listening for webhooks on port %s...\n", PORT)
-
-	err = server.ListenAndServe()
-	if err != nil && !errors.Is(err, http.ErrServerClosed) {
-		panic("HTTP server failed: " + err.Error())
-	}
-
-	select {}
+	server.Start(":8080")
 }

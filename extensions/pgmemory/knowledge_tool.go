@@ -3,10 +3,8 @@ package pgmemory
 import (
 	"errors"
 	"fmt"
-	"strings"
 
 	"github.com/firebase/genkit/go/ai"
-	"github.com/firebase/genkit/go/genkit"
 )
 
 const ToolNameFormat = "%s_%s_tool"
@@ -18,60 +16,30 @@ type (
 		Query string `json:"query" jsonschema_description:"The specific search query or keywords to retrieve relevant information from the knowledge base. Should be clear and focused on the topic."`
 	}
 
-	DocumentResult struct {
-		Label   string `json:"label" jsonschema_description:"The category or source label of the retrieved document."`
-		Content string `json:"content" jsonschema_description:"The text content of the retrieved document."`
-	}
-
 	KnowledgeResponse struct {
-		Results []DocumentResult `json:"results" jsonschema_description:"List of relevant documents found."`
-		Count   int              `json:"count" jsonschema_description:"Number of documents retrieved. 0 if nothing was found."`
+		Documents []*ai.Document `json:"documents" jsonschema_description:"List of relevant documents found."`
+		Count     int            `json:"count" jsonschema_description:"Number of documents retrieved. 0 if nothing was found."`
 	}
 )
 
 func (m *KnowledgeMemory) AsTool(agentID string, limit int) ai.Tool {
-	toolName := fmt.Sprintf(ToolNameFormat, agentID, m.cfg.Name)
+	if m.tool != nil {
+		return m.tool
+	}
 
-	f := func(ctx *ai.ToolContext, query KnowledgeQuery) (KnowledgeResponse, error) {
-		resp, err := m.RetrieveKnowledge(ctx, agentID, query.Query, limit)
+	fn := func(ctx *ai.ToolContext, query KnowledgeQuery) (KnowledgeResponse, error) {
+		resp := KnowledgeResponse{}
+
+		docs, err := m.RetrieveKnowledge(ctx, agentID, query.Query, limit)
 		if err != nil {
-			return KnowledgeResponse{}, errors.Join(ErrKnowledgeMemoryFailure, err)
+			return resp, errors.Join(ErrKnowledgeMemoryFailure, err)
 		}
 
-		kResponse := KnowledgeResponse{
-			Count: len(resp.Documents),
-		}
-
-		if kResponse.Count < 1 {
-			return kResponse, nil
-		}
-
-		for _, doc := range resp.Documents {
-			label, _ := doc.Metadata[LabelKey].(string)
-			if label == "" {
-				label = "unlabeled"
-			}
-
-			kResponse.Results = append(
-				kResponse.Results,
-				DocumentResult{
-					Label:   label,
-					Content: documentToText(doc),
-				},
-			)
-		}
-
-		return kResponse, nil
+		resp.Documents = docs
+		resp.Count = len(docs)
+		return resp, nil
 	}
 
-	return genkit.DefineTool(m.g, toolName, m.cfg.Description, f)
-}
-
-func documentToText(doc *ai.Document) string {
-	var b strings.Builder
-	for _, part := range doc.Content {
-		b.WriteString(part.Text)
-		b.WriteString("\n")
-	}
-	return b.String()
+	m.tool = ai.DefineTool(m.reg, fmt.Sprintf(ToolNameFormat, agentID, m.cfg.Name), m.cfg.Description, fn)
+	return m.tool
 }

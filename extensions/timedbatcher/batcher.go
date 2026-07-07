@@ -14,8 +14,10 @@ import (
 var _ agens.MessageBatcher = &TimedBatcher{}
 
 var (
+	// ErrEmptyBatchID is returned when the provided batch identifier is an empty string.
 	ErrEmptyBatchID = errors.New("batch id cannot be empty")
 
+	// ErrNilMessage is returned when a nil pointer is passed instead of a valid AI message.
 	ErrNilMessage = errors.New("message cannot be nil")
 )
 
@@ -25,6 +27,8 @@ type batchState struct {
 	out      chan []*ai.Message
 }
 
+// TimedBatcher automatically aggregates messages by ID and flushes them
+// after a configurable Duration has elapsed.
 type TimedBatcher struct {
 	Duration time.Duration
 
@@ -32,7 +36,9 @@ type TimedBatcher struct {
 	batches map[string]*batchState
 }
 
-func (b *TimedBatcher) Add(_ context.Context, batchID string, msg *ai.Message) ([]*ai.Message, error) {
+// Add appends an AI message to a specific batch. The first caller that creates
+// the batch blocks until either the Duration timer expires or the Context is canceled.
+func (b *TimedBatcher) Add(ctx context.Context, batchID string, msg *ai.Message) ([]*ai.Message, error) {
 	if batchID == "" {
 		return nil, ErrEmptyBatchID
 	} else if msg == nil {
@@ -74,5 +80,20 @@ func (b *TimedBatcher) Add(_ context.Context, batchID string, msg *ai.Message) (
 	if exists {
 		return nil, nil
 	}
-	return <-state.out, nil
+
+	select {
+	case msgs := <-state.out:
+		return msgs, nil
+	case <-ctx.Done():
+		b.mu.Lock()
+		currentState, ok := b.batches[batchID]
+		if ok && currentState == state {
+			state.timer.Stop()
+			delete(b.batches, batchID)
+			close(state.out)
+		}
+		b.mu.Unlock()
+
+		return nil, ctx.Err()
+	}
 }

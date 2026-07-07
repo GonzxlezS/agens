@@ -14,8 +14,8 @@ import (
 	"github.com/firebase/genkit/go/plugins/googlegenai"
 	"github.com/gonzxlezs/agens"
 	"github.com/gonzxlezs/agens/extensions/pgmemory"
+	"github.com/gonzxlezs/agens/extensions/tgbot"
 	"github.com/gonzxlezs/agens/extensions/timedbatcher"
-	"github.com/gonzxlezs/agens/triggers/tgbot"
 	_ "github.com/lib/pq"
 	"google.golang.org/genai"
 
@@ -81,53 +81,59 @@ func main() {
 		panic(err)
 	}
 
-	historyMemory, err := pgmemory.NewHistoryMemory("history", db)
+	historyMemory, err := pgmemory.NewHistoryMemory(pgmemory.HistoryMemoryConfig{
+		TableName: "history",
+		DB:        db,
+		OwnsDB:    true,
+	})
 	if err != nil {
 		panic(err)
 	}
+	defer historyMemory.Close()
 
 	// Agent
-	e21, err := agens.NewAgent(g, agens.AgentConfig{
-		ID:          "agent01",
+	e21, err := agens.NewAgent(agens.AgentConfig{
+		ID:          "tg_agent1",
 		Name:        "e21",
 		Description: "a general-purpose virtual assistant",
 		Instructions: []string{
 			"You receive messages from users via a Telegram bot and must respond to their messages.",
 		},
-		Model:             model,
-		HistoryMemory:     historyMemory,
-		HistoryMemorySize: 20,
+		Model:         model,
+		HistoryMemory: historyMemory,
+		HistoryManager: agens.SlidingWindowManager{
+			WindowSize: 20,
+		},
 	})
 
 	if err != nil {
 		panic(err)
 	}
 
-	// Telegram bot trigger
-	tgTrigger, err := tgbot.NewWebhookTrigger(
-		"tgbot01",
-		TGBOT_TOKEN,
-		&tgbot.WebhookTriggerOpts{
-			SecretToken: TGBOT_WEBHOOK_SECRET,
-		},
-	)
+	genkit.RegisterAction(g, e21)
 
+	// Telegram bot
+	gateway, err := tgbot.NewTgGateway(tgbot.TgGatewayConfig{
+		ID:            "tgbot01",
+		Token:         TGBOT_TOKEN,
+		WebhookSecret: TGBOT_WEBHOOK_SECRET,
+	})
 	if err != nil {
 		panic(err)
 	}
 
-	if err := tgTrigger.RegisterAgent(e21); err != nil {
+	if err := gateway.RegisterAgent(e21); err != nil {
 		panic(err)
 	}
 
 	batcher := &timedbatcher.TimedBatcher{Duration: 5 * time.Second}
-	if err := tgTrigger.WithBatcher(batcher); err != nil {
+	if err := gateway.WithMessageBatcher(batcher); err != nil {
 		panic(err)
 	}
 
 	// server
 	mux := http.NewServeMux()
-	for _, route := range tgTrigger.GetRoutes() {
+	for _, route := range gateway.GetRoutes() {
 		pattern := fmt.Sprintf("%s %s", route.Method, route.Path)
 		mux.HandleFunc(pattern, route.Handler)
 	}
@@ -146,10 +152,10 @@ func main() {
 		}
 	}(server)
 
-	err = tgbot.SetWebhook(tgTrigger, TGBOT_WEBHOOK_DOMAIN)
+	err = gateway.SetWebhook(TGBOT_WEBHOOK_DOMAIN, nil)
 	if err != nil {
 		panic(err)
 	}
 
-	select {}
+	gateway.IDLE()
 }

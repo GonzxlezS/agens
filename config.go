@@ -2,24 +2,12 @@ package agens
 
 import (
 	"context"
-	"errors"
-	"fmt"
 	"strings"
 
 	"github.com/firebase/genkit/go/ai"
-	"github.com/firebase/genkit/go/genkit"
+	"github.com/firebase/genkit/go/core"
+	"github.com/firebase/genkit/go/core/api"
 )
-
-// DefaultSystemMessageFormat is the default template used to format the
-// system message passed to the AI model.
-const DefaultSystemMessageFormat = `You are %s, %s.
-instructions:
-%s
----
-%s`
-
-// ErrNoValidMessages is returned when the message sequence fails validation or is empty.
-var ErrNoValidMessages = errors.New("no valid messages in sequence")
 
 // AgentConfig holds the execution parameters, memory providers, and behavior
 // definitions for an Agent.
@@ -37,11 +25,14 @@ type AgentConfig struct {
 	Instructions []string
 
 	// Model is the AI model object that the agent will use to generate responses.
-	// If specified, it takes precedence over ModelName.
 	Model ai.ModelArg
 
 	// Tools is a list of tools that the agent can use.
 	Tools []ai.ToolRef
+
+	// MaxTurns Set maximum tool call iterations
+	// Default: 5 (Genkit)
+	MaxTurns int
 
 	// GenerateOptions are extra options passed to the genkit.Generate function.
 	GenerateOptions []ai.GenerateOption
@@ -49,221 +40,284 @@ type AgentConfig struct {
 	// HistoryMemory is responsible for persisting the conversation history.
 	HistoryMemory HistoryMemory
 
-	// HistoryMemorySize limits the number of messages kept in the context window.
-	HistoryMemorySize int
+	// HistoryManager handles the lifecycle strategy of the conversation history.
+	// If not explicitly provided, it defaults to a SlidingWindowManager initialized
+	// with a standard default window size.
+	HistoryManager HistoryManager
+
+	// KnowledgeMode defines how knowledge is used in the agent.
+	// If not explicitly set, the mode is determined dynamically according to the following rules:
+	// - KnowledgeModeNone: the default value when neither KnowledgeMemory nor KnowledgeQueryer has been configured.
+	// - KnowledgeModeStep: the default value when KnowledgeQueryer has been configured.
+	// - KnowledgeModeTool: the default value when KnowledgeMemory has been configured.
+	//
+	// KnowledgeModeTool requires a valid KnowledgeMemory; KnowledgeModeStep and KnowledgeModeBoth require both a valid
+	// KnowledgeMemory and a valid KnowledgeQueryer; otherwise, the agent configuration will fail during the validation phase.
+	KnowledgeMode KnowledgeMode
 
 	// KnowledgeMemory enables RAG (Retrieval-Augmented Generation) capabilities.
+	// Required if KnowledgeMode is Step, Tool, or Both.
 	KnowledgeMemory KnowledgeMemory
 
+	// KnowledgeQueryer generates search queries for RAG systems based on the input.
+	// Required if KnowledgeMode is Step or Both.
+	KnowledgeQueryer KnowledgeQueryer
+
 	// KnowledgeRetrieveLimit sets the maximum number of documents fetched per query.
+	// Used in both Step and Tool modes if applicable.
 	KnowledgeRetrieveLimit int
 
 	// SystemPromptFn allows for a custom implementation of the system instruction builder.
 	SystemPromptFn func(ctx context.Context, cfg *AgentConfig, in *Input) (string, error)
-
-	// SortMessagesFn provides a hook to filter or reorder messages before LLM inference.
-	SortMessagesFn func(msgs []*ai.Message) ([]*ai.Message, error)
 }
 
-// GenerateSystemPrompt determines and executes the strategy for building
+// Prepare sets certain configuration values before they are validated.
+// It is used when initializing a new Agent.
+func (cfg *AgentConfig) Prepare() error {
+	// Basic data
+	cfg.ID = strings.TrimSpace(cfg.ID)
+	cfg.Name = strings.TrimSpace(cfg.Name)
+	cfg.Description = strings.TrimSpace(cfg.Description)
+
+	// Instructions
+	cleanedInstructions := cfg.Instructions[:0]
+	for _, value := range cfg.Instructions {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			cleanedInstructions = append(cleanedInstructions, trimmed)
+		}
+	}
+
+	cfg.Instructions = cleanedInstructions
+
+	// HistoryManager
+	if (cfg.HistoryMemory != nil) && (cfg.HistoryManager == nil) {
+		cfg.HistoryManager = SlidingWindowManager{
+			WindowSize: DefaultWindowSize,
+		}
+	}
+
+	// KnowledgeMode
+	if cfg.KnowledgeMode == "" {
+		cfg.KnowledgeMode = KnowledgeModeNone
+
+		if cfg.KnowledgeMemory != nil {
+			cfg.KnowledgeMode = KnowledgeModeTool
+		}
+
+		if cfg.KnowledgeQueryer != nil {
+			cfg.KnowledgeMode = KnowledgeModeStep
+		}
+	}
+
+	// KnowledgeRetrieveLimit
+	if cfg.KnowledgeRetrieveLimit == 0 {
+		cfg.KnowledgeRetrieveLimit = DefaultKnowledgeRetrieveLimit
+	}
+
+	return cfg.Validate()
+}
+
+// SystemPrompt determines and executes the strategy for building
 // the agent's system instructions.
-func (cfg *AgentConfig) GenerateSystemPrompt(ctx context.Context, input *Input) (string, error) {
+func (cfg *AgentConfig) SystemPrompt(ctx context.Context, input *Input) (string, error) {
 	if cfg.SystemPromptFn != nil {
 		return cfg.SystemPromptFn(ctx, cfg, input)
 	}
 	return DefaultSystemPromptFn(ctx, cfg, input)
 }
 
-func (cfg *AgentConfig) flowFn(g *genkit.Genkit) func(ctx context.Context, input *Input) (*ai.ModelResponse, error) {
-	var baseOpts = cfg.generateOptions()
-
-	return func(ctx context.Context, input *Input) (*ai.ModelResponse, error) {
-		// system prompt
-		systemPrompt, err := cfg.GenerateSystemPrompt(ctx, input)
-		if err != nil {
-			return &ai.ModelResponse{}, err
-		}
-
-		// history
-		history, err := cfg.retrieveHistory(ctx, input.SessionID())
-		if err != nil {
-			return &ai.ModelResponse{}, err
-		}
-
-		// messages
-		messages, err := cfg.sortMessages(ctx, append(history, input.Messages...))
-		if err != nil {
-			return &ai.ModelResponse{}, err
-		}
-
-		// generate options
-		generateOpts := append(baseOpts,
-			ai.WithSystem(systemPrompt),
-			ai.WithMessages(messages...),
-		)
-
-		generateOpts = append(generateOpts, input.outputOptions()...)
-
-		// generate
-		resp, err := genkit.Generate(ctx, g, generateOpts...)
-
-		// store history
-		if err == nil {
-			err = cfg.storeHistory(ctx, input.SessionID(), resp.History())
-		}
-
-		// response
-		return resp, err
+// Validate checks that the configuration is correct without modifying its values.
+func (cfg *AgentConfig) Validate() error {
+	if cfg.ID == "" {
+		return ErrAgentIDEmpty
 	}
+
+	if cfg.Name == "" {
+		return ErrAgentNameEmpty
+	}
+
+	if cfg.Description == "" {
+		return ErrAgentDescriptionEmpty
+	}
+
+	if len(cfg.Instructions) == 0 {
+		return ErrAgentInstructionsEmpty
+	}
+
+	if (cfg.HistoryMemory != nil) && (cfg.HistoryManager == nil) {
+		return ErrHistoryManagerRequired
+	}
+
+	switch cfg.KnowledgeMode {
+	case KnowledgeModeNone:
+		// pass
+
+	case KnowledgeModeTool:
+		if cfg.KnowledgeMemory == nil {
+			return ErrKnowledgeMemoryRequired
+		}
+
+	case KnowledgeModeStep, KnowledgeModeBoth:
+		if cfg.KnowledgeMemory == nil {
+			return ErrKnowledgeMemoryRequired
+		}
+		if cfg.KnowledgeQueryer == nil {
+			return ErrKnowledgeQueryerRequired
+		}
+
+	default:
+		return ErrInvalidKnowledgeMode
+	}
+	return nil
 }
 
-func (cfg *AgentConfig) generateOptions() []ai.GenerateOption {
-	opts := append([]ai.GenerateOption(nil), cfg.GenerateOptions...)
+func (cfg *AgentConfig) genFlow(ctx context.Context, r api.Registry, input *Input) (*ai.ModelResponse, error) {
+	// Validate
+	if err := cfg.Validate(); err != nil {
+		return &ai.ModelResponse{}, err
+	}
+
+	// System prompt
+	systemPrompt, err := cfg.SystemPrompt(ctx, input)
+	if err != nil {
+		return &ai.ModelResponse{}, err
+	}
+
+	// Retrieve history
+	stateless, _ := StatelessFromContext(ctx)
+
+	history, err := cfg.retrieveHistory(ctx, input.GatewayID, input.SessionID, stateless)
+	if err != nil {
+		return &ai.ModelResponse{}, err
+	}
+
+	// Retrieve knowledge
+	docs, err := cfg.retrieveKnowledge(ctx, input)
+	if err != nil {
+		return &ai.ModelResponse{}, err
+	}
+
+	// Build generation options for the LLM
+	genOpts := cfg.genOptions(input, systemPrompt, history, docs)
+
+	// Execute LLM generation
+	ctx = cfg.setGenContext(ctx, input)
+
+	resp, err := ai.Generate(ctx, r, genOpts...)
+	if err != nil {
+		return &ai.ModelResponse{}, err
+	}
+
+	// Store history
+	err = cfg.storeHistory(ctx, input.GatewayID, input.SessionID, stateless, resp.History())
+
+	return resp, err
+}
+
+func (cfg *AgentConfig) retrieveHistory(ctx context.Context, gatewayID string, sessionID string, stateless bool) ([]*ai.Message, error) {
+	if (cfg.HistoryMemory == nil) || stateless {
+		return []*ai.Message{}, nil
+	}
+
+	// Empty data implies an anonymous or stateless call.
+	// We bypass the storage layer and return an empty history immediately.
+	if (gatewayID == "") || (sessionID == "") {
+		return []*ai.Message{}, nil
+	}
+
+	return core.Run(ctx, "history", func() ([]*ai.Message, error) {
+		history, err := cfg.HistoryMemory.RetrieveHistory(ctx, cfg.ID, gatewayID, sessionID)
+		if (err != nil) || (history == nil) {
+			return []*ai.Message{}, err
+		}
+		return history, nil
+	})
+}
+
+func (cfg *AgentConfig) retrieveKnowledge(ctx context.Context, input *Input) ([]*ai.Document, error) {
+	// Only retrieve knowledge if mode is Step or Both
+	if (cfg.KnowledgeMode != KnowledgeModeStep) && (cfg.KnowledgeMode != KnowledgeModeBoth) {
+		return []*ai.Document{}, nil
+	}
+
+	// Skip knowledge retrieval on tool call continuations/restarts.
+	if (input.ToolResponses != nil) || (input.ToolRestarts != nil) {
+		return []*ai.Document{}, nil
+	}
+
+	return core.Run(ctx, "knowledge", func() ([]*ai.Document, error) {
+		query, err := cfg.KnowledgeQueryer.GenerateQuery(ctx, input)
+		if err != nil {
+			return []*ai.Document{}, err
+		}
+
+		docs, err := cfg.KnowledgeMemory.RetrieveKnowledge(ctx, cfg.ID, query, cfg.KnowledgeRetrieveLimit)
+		if (err != nil) || (docs == nil) {
+			return []*ai.Document{}, err
+		}
+
+		return docs, nil
+	})
+}
+
+func (cfg *AgentConfig) genOptions(input *Input, systemPrompt string, history []*ai.Message, docs []*ai.Document) []ai.GenerateOption {
+	// Base options + System
+	opts := append(cfg.GenerateOptions, ai.WithSystem(systemPrompt))
 
 	// Model
 	if cfg.Model != nil {
-		opts = append(opts,
-			ai.WithModel(cfg.Model),
-		)
+		opts = append(opts, ai.WithModel(cfg.Model))
 	}
 
-	// Tools
+	// Tools: include KnowledgeMemory as a tool if mode is Tool or Both
 	tools := append([]ai.ToolRef(nil), cfg.Tools...)
 
-	if cfg.KnowledgeMemory != nil {
+	if (cfg.KnowledgeMode == KnowledgeModeTool) || (cfg.KnowledgeMode == KnowledgeModeBoth) {
 		tools = append(tools,
 			cfg.KnowledgeMemory.AsTool(cfg.ID, cfg.KnowledgeRetrieveLimit),
 		)
 	}
 
 	if len(tools) > 0 {
-		opts = append(opts,
-			ai.WithTools(tools...),
-		)
+		opts = append(opts, ai.WithTools(tools...))
 	}
 
+	// MaxTurns
+	if cfg.MaxTurns != 0 {
+		opts = append(opts, ai.WithMaxTurns(cfg.MaxTurns))
+	}
+
+	// Input
+	opts = append(opts, input.genOptions(history, docs)...)
 	return opts
 }
 
-func (cfg *AgentConfig) sortMessages(ctx context.Context, msgs []*ai.Message) ([]*ai.Message, error) {
-	return genkit.Run(ctx, "sortMessages", func() ([]*ai.Message, error) {
-		if cfg.SortMessagesFn != nil {
-			return cfg.SortMessagesFn(msgs)
-		}
-		return DefaultSortMessagesFn(msgs)
-	})
+func (cfg *AgentConfig) setGenContext(ctx context.Context, input *Input) context.Context {
+	ctx = ContextWithGatewayID(ctx, input.GatewayID)
+	ctx = ContextWithSessionID(ctx, input.SessionID)
+	ctx = ContextWithSenderID(ctx, input.SenderID)
+
+	return ContextWithAgentID(ctx, cfg.ID)
 }
 
-func (cfg *AgentConfig) retrieveHistory(ctx context.Context, sessionID string) ([]*ai.Message, error) {
-	if cfg.HistoryMemory == nil {
-		return []*ai.Message{}, nil
-	}
-
-	return genkit.Run(ctx, "history", func() ([]*ai.Message, error) {
-		return cfg.HistoryMemory.RetrieveHistory(ctx, cfg.ID, sessionID)
-	})
-}
-
-func (cfg *AgentConfig) storeHistory(ctx context.Context, sessionID string, messages []*ai.Message) error {
-	if cfg.HistoryMemory == nil {
+func (cfg *AgentConfig) storeHistory(ctx context.Context, gatewayID string, sessionID string, stateless bool, messages []*ai.Message) error {
+	if (cfg.HistoryMemory == nil) || stateless {
 		return nil
 	}
 
-	_, err := genkit.Run(ctx, "storeHistory", func() (bool, error) {
-		err := cfg.HistoryMemory.StoreHistory(ctx,
-			cfg.ID,
-			sessionID,
-			messages,
-			cfg.HistoryMemorySize,
-		)
+	if (gatewayID == "") || (sessionID == "") {
+		return nil
+	}
 
+	_, err := core.Run(ctx, "storeHistory", func() (bool, error) {
+		messages, err := cfg.HistoryManager.ProcessHistory(ctx, messages)
+		if err != nil {
+			return false, err
+		}
+
+		err = cfg.HistoryMemory.StoreHistory(ctx, cfg.ID, gatewayID, sessionID, messages)
 		return (err == nil), err
 	})
 
 	return err
-}
-
-// DefaultSystemPromptFn constructs a standardized system prompt by aggregating
-// agent metadata, core instructions, and dynamic runtime prompts.
-func DefaultSystemPromptFn(ctx context.Context, cfg *AgentConfig, input *Input) (string, error) {
-	var b strings.Builder
-	for _, Instruction := range cfg.Instructions {
-		fmt.Fprintf(&b, "- %s\n", Instruction)
-	}
-
-	return fmt.Sprintf(DefaultSystemMessageFormat,
-		cfg.Name,
-		cfg.Description,
-		b.String(),
-		input.AdditionalSystemPrompt,
-	), nil
-}
-
-// DefaultSortMessagesFn filters and validates the message sequence to ensure
-// it follows a valid role-based order (User -> Model -> Tool).
-func DefaultSortMessagesFn(msgs []*ai.Message) ([]*ai.Message, error) {
-	if msgs == nil {
-		return nil, nil
-	}
-
-	var (
-		result       = make([]*ai.Message, 0, len(msgs))
-		previousRole ai.Role
-
-		msg     *ai.Message
-		nextMsg *ai.Message
-	)
-
-	for i := 0; i < len(msgs); i++ {
-		msg = msgs[i]
-
-		if len(result) > 0 {
-			previousRole = result[len(result)-1].Role
-		}
-
-		if i+1 < len(msgs) {
-			nextMsg = msgs[i+1]
-		} else {
-			nextMsg = nil
-		}
-
-		switch {
-		case (previousRole == "") && (msg.Role == ai.RoleUser):
-			result = append(result, msg)
-
-		case (msg.Role == ai.RoleUser) && (previousRole == ai.RoleUser || previousRole == ai.RoleModel):
-			result = append(result, msg)
-
-		case (msg.Role == ai.RoleModel) && (previousRole == ai.RoleUser || previousRole == ai.RoleTool):
-			if hasToolRequests(msg) {
-				if (nextMsg != nil) && (nextMsg.Role == ai.RoleTool) {
-					result = append(result, msg)
-
-					result = append(result, nextMsg)
-					i++
-				}
-
-				continue // discard messages
-			}
-
-			result = append(result, msg)
-
-		default:
-			continue // discard message
-		}
-	}
-
-	if len(result) == 0 {
-		return nil, ErrNoValidMessages
-	}
-	return result, nil
-}
-
-func hasToolRequests(msg *ai.Message) bool {
-	for _, part := range msg.Content {
-		if part.IsToolRequest() {
-			return true
-		}
-	}
-	return false
 }
